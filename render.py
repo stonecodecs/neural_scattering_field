@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Union, Optional, Tuple, Callable
-from utils import prepare_chunks, local_to_world_rotation, spherical_to_cartesian
+from utils import prepare_chunks, local_to_world_rotation, spherical_to_cartesian, cartesian_to_spherical
 from sh import project_to_sh, sh_basis, sample_henyey_greenstein, \
         sample_isotropic, isotropic_pdf, henyey_greenstein_pdf
 
@@ -168,6 +168,35 @@ def sample_rays(
     
     return samples_3d, z_vals
 
+import numpy as np
+
+def eval_env_map(direction, env_map):
+    """
+    Sample an environment map (assumed to be in equirectangular format)
+    given a 3D directional vector.
+    
+    Args:
+        direction (np.array): 3D normalized direction (S, 3).
+        env_map (np.array): The environment map image as an array with shape (H, W, 3).
+    
+    Returns:
+        torch.Tensor: The sampled color (or value) from the environment map. (S, 3)
+    """
+    xyz = direction / torch.norm(direction, dim=-1, keepdim=True)
+    
+    # convert to spherical coordinates.
+    theta, phi = cartesian_to_spherical(xyz).unbind(-1)
+    
+    # map to positive normalized texture coordinates (u, v)
+    u = phi / (2 * np.pi)  # horizontal
+    v = theta / np.pi  # vertical
+    
+    # convert normalized coordinates to pixel coordinates
+    height, width, _ = env_map.shape
+    pixel_x = torch.floor(u * width % width).type(torch.int)
+    pixel_y = torch.floor(v * height % height).type(torch.int)
+    return env_map[pixel_y, pixel_x]
+
 
 def eval_sh(coefs, d, lmax=2, polar=True):
     """ Get radiance of SH lighting from direction d, given its coefficients. """
@@ -193,30 +222,65 @@ def eval_sh(coefs, d, lmax=2, polar=True):
 
 def sample_next_directions(ray_dir, phase_function, num_samples):
     """
-    Samples a random direction given a phase function.
+    Samples 'num_samples' random directions given a phase function.
     Automatically converts into world coordinates. 
-    (Might need to implement for batching? Maybe `vmap` will work.)
 
     Args:
-        ray_dir (3 vector): current direction of the main ray before scattering (3,)
+        ray_dir (3 vector): current direction of the main ray before scattering ([N,]H,W,3)
+            (Meaning: direction of ray for all "pixels")
         phase_function (function): phase function that takes in UV random [0,1] values
         num_samples (int): Number of directions to sample.
 
     Returns:
-        Sample directions in shape (3, N).
+        Sample directions in shape ([N,], S, 3).
     """
-    R = local_to_world_rotation(ray_dir)
-    theta, phi = phase_function(*torch.rand(2, num_samples)) # w.r.t the current ray direction
-    sample_dirs = R @ spherical_to_cartesian(theta, phi)
-    return sample_dirs  # (3, num_samples) matrix
+    orig_shape = ray_dir.shape
+    ray_dir_flat = ray_dir.reshape(-1, 3)
+    R = local_to_world_rotation(ray_dir_flat) # (NHWS,3,3)
+    theta_phi = phase_function(*torch.rand(2, num_samples)) # w.r.t the current ray direction [-1, 1]
+    local_dirs = spherical_to_cartesian(theta_phi) # (num_samples, 3)
+    world_dirs = torch.einsum("bij,kj->bki", R, local_dirs)
+    # sample_dirs = R @ spherical_to_cartesian(theta, phi)
+    # return sample_dirs  # (3, num_samples) matrix
+    return world_dirs.view(*orig_shape[:-1], num_samples, 3)
 
 
-def single_scatter():
+def single_scatter(
+    env_map,
+    x,  # current sample point along ray
+    ray_dir,
+    sigma_s,
+    g,
+    visibility_network,
+    phase_function=sample_henyey_greenstein,
+    phase_function_pdf=henyey_greenstein_pdf,
+    num_samples=64
+):
     """
-    Returns the approximate light contribution using HG phase function to "query" the environment map.
+    Returns the approximate light contribution using HG phase function to query the environment map.
+
+    Args:
+        env_map (image): env map for lighting
+        x (vec3): 3D position of sample points along rays ([N]HWS, 3)
+        ray_dir (torch.tensor): ray direction per sample ([N,] H, W, 3) omit S duplicates
+        sigma_s (vec3): scattering coef
+        g (float): HG parameter
+        visibility_network (_type_): VisibilityMLP
+        phase_function (_type_, optional): phase function sampler. Defaults to sample_henyey_greenstein.
+        phase_function_pdf (_type_, optional): pdf of phase function. Defaults to henyey_greenstein_pdf.
+        num_samples (int, optional): Number of samples to take from env_map. Defaults to 64.
+
+    Returns:
+        torch.tensor: radiance (NHW,S,3)
     """
-    # TODO
-    pass
+    # 'g' should be "baked-in" to the 'phase_function' when passing it (..., S, 3)
+    sample_dirs = sample_next_directions(ray_dir, phase_function=phase_function, num_samples=num_samples)
+    T = visibility_network(torch.full(len(sample_dirs.reshape(-1,3)), x), sample_dirs.reshape(-1, 3)) # (...,3) for both
+    cos_theta = torch.sum(ray_dir.view(-1,3) * sample_dirs.view(-1, 3), dim=-1)  # (...) dot product per row
+    pdf = torch.nan_to_num(phase_function_pdf(cos_theta, g), nan=1e-6)  # (scalar) NOTE: possibly 1e-6 hardcoded is a bad idea (used to avoid NaN)
+    L_env = eval_env_map(cos_theta, env_map) # environment lighting (...,S,3) RGB
+    L = torch.mean(L_env * T * sigma_s / pdf, dim=0) # (...,3)
+    return L
 
 
 def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, ray_dir: torch.Tensor, num_samples=64):
@@ -240,8 +304,12 @@ def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, ray_dir: torch.Tensor,
 
 def volume_render(
     raw: torch.tensor,
+    points: torch.tensor,
     z_vals: torch.tensor,
     rays_d: torch.tensor,
+    visibility_network: nn.Module,
+    sh_coefs: torch.tensor,
+    env_map: torch.tensor,
     raw_noise_std: Optional[float] = 0.0,
     white_background: Optional[bool] = False,
     batched: Optional[bool] = False
@@ -254,11 +322,19 @@ def volume_render(
     Parameters
     ----------
     raw : torch.tensor
-        Model predictions. [RGB, density] ([N,] H, W, S, 4)
+        ScatterMLP predictions. [sigma_t, sigma_s, g] ([N,] H, W, S, 3)
+    points : torch.tensor
+        3D coordinate points of each sample ([N,] H, W, S, 3)
     z_vals : torch.tensor
         Ray depths (from near plane) ([N,] H, W, S)
     rays_d : torch.tensor
         Ray directions. ([N,] H, W, 3)
+    visibility_network : nn.Module
+        VisibilityMLP to predict transmittance per randomly sampled next direction (for single-scattering)
+    sh_coefs : torch.tensor
+        SH coefficients for multi-scatter from SphericalHarmonicsMLP (9, 3)
+    env_map : Optional[torch.tensor]
+        Lighting from environment map. (H,W,3)
     raw_noise_std : Optional[float], optional
         Standard deviation of noise applied to `raw`, by default 0.0 (no noise)
     white_background : Optional[bool], optional
@@ -272,8 +348,6 @@ def volume_render(
         - weights         ([N,]H,W,S), 
         - depth map       ([N,]H,W) 
     """
-    # TODO: add in single and multiple scattering here
-
     if batched:
         batched_vr = torch.vmap(
             volume_render,
@@ -283,7 +357,8 @@ def volume_render(
             raw, z_vals, rays_d, 
             raw_noise_std=raw_noise_std,
             white_background=white_background, batched=False)
-
+    # Here, we already have our samples along each ray (H,W,S)
+    # so we just take the difference of 'z' between the samples for transmittance (via sigma_t)
     delta_z = z_vals[..., 1:] - z_vals[..., :-1]  # distance between samples
     delta_z = torch.concat([
         delta_z,
@@ -299,17 +374,21 @@ def volume_render(
     if raw_noise_std > 0.0:
         noise = torch.randn(raw[..., 3].shape, device=z_vals.device) * raw_noise_std
 
-    # predict density + transmittance for each sample
-    rgb, density = raw[..., :3], raw[..., 3]    # TODO: change for msnerf (raw predicts more than just rgbc now)
-    transmittance = torch.exp(-nn.functional.relu(density + noise) * delta_z) # (H,W,S)
+    # predict "initial" transmittance for each sample
+    sigma_t, sigma_s, g_phase_param = raw[..., :3]
+    transmittance = torch.exp(-nn.functional.relu(sigma_t + noise) * delta_z) # (H,W,S)
     opacity = 1.0 - transmittance
     acc_T = torch.roll(torch.cumprod(transmittance + 1e-10, dim=-1), 1, dims=(-1))
     acc_T[..., 0] = 1.0  # transmittance always starts unfettered (1.0)
-    weights = opacity * acc_T
+    weights = opacity * acc_T   # used for fine sampling on fine-pass
 
-    rgb = torch.sigmoid(rgb)
-    rgb_map = torch.sum(weights.unsqueeze(-1) * rgb, dim=-2) # broadcast + take expectation over all samples
-    depth_map = torch.sum(weights * z_vals, dim=-1)
+    # transmittance is already applied internally to the functions below
+    Ls = single_scatter(env_map, points, rays_d, sigma_s, visibility_network, num_samples=64)
+    Lm = multi_scatter(sh_coefs, sigma_s, rays_d)
+    L = Ls + Lm  # output shape: ([N,] H, W, S, 3)
+
+    rgb_map = torch.sum(L * weights.unsqueeze(-1), dim=-2) # sum sample contributions ([N,] H, W, 3)
+    depth_map = torch.sum(weights * z_vals, dim=-1)  # this only relies on T, so it's okay to not alter
     # disp_map = 1.0 / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, dim=-1))
 
     # weight accumulation; [0,1] where 0 is fully transparent, and 1 is fully absorbed
@@ -596,7 +675,7 @@ def sample_isotropic(u, v):
     """
     theta = np.arccos(np.clip(2 * u - 1, -1, 1))
     phi = 2 * np.pi * v
-    return theta, phi
+    return torch.stack([theta, phi], dim=-1)
 
 
 def isotropic_pdf(x=0):
@@ -618,7 +697,7 @@ def sample_henyey_greenstein(u, v, g):
     
     theta = np.arccos(np.clip(cos_theta, -1, 1))
     phi = 2 * np.pi * v
-    return theta, phi
+    return torch.stack([theta, phi], dim=-1)
 
 def henyey_greenstein_pdf(cos_theta, g):
     return (1 - g**2) / (4 * np.pi * (1 + g**2 - 2 * g * cos_theta)**(3/2))

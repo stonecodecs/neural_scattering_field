@@ -74,7 +74,7 @@ class FeatureMLP(nn.Module):
 # Scatter Network gets sigma_t, sigma_s, 'g'
 class ScatterMLP(nn.Module):
     # outputs [sigma_s, sigma_s, HG parameter 'g']
-    def __init__(self, dim_x=256, dim_z=128, dim_out=3, num_layers=1):
+    def __init__(self, dim_x=256, dim_z=128, dim_out=5, num_layers=1):
         super().__init__()
         self.mlp = create_mlp(dim_x, dim_z, dim_out, num_layers=num_layers)
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers)
@@ -82,8 +82,8 @@ class ScatterMLP(nn.Module):
     def forward(self, features):
         output = self.layer(features)
         sigma_t = torch.relu(output[:, 0])  # extinction
-        sigma_s = torch.relu(output[:, 1])  # scattering
-        g = torch.tanh(output[:, 2])  # g [-1, 1]
+        sigma_s = torch.relu(output[:, 1:4])  # scattering (per RGB)
+        g = torch.tanh(output[:, 4])  # g [-1, 1]
         return sigma_t, sigma_s, g
 
 

@@ -80,23 +80,38 @@ def quaternion_to_rotation_matrix(q):
         [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)]
   ])
 
-def spherical_to_cartesian(theta, phi):
+def spherical_to_cartesian(theta_phi):
     """
     From theta, phi in spherical coordinates, convert to a Cartesian 3D directional vector.
 
     """
-    theta, phi = torch.as_tensor(theta), torch.as_tensor(phi)
-    x = (torch.sin(theta) * torch.cos(phi)).view(1, -1)
-    y = (torch.sin(theta) * torch.sin(phi)).view(1, -1)
-    z = (torch.cos(theta)).view(1, -1)
-    return torch.vstack((x,y,z))
+    theta = theta_phi[..., 0]
+    phi = theta_phi[..., 1]
+    
+    sin_theta = torch.sin(theta)
+    x = sin_theta * torch.cos(phi)
+    y = sin_theta * torch.sin(phi)
+    z = torch.cos(theta)
+    
+    return torch.stack([x, y, z], dim=-1)
+    # theta, phi = torch.as_tensor(theta), torch.as_tensor(phi)
+    # x = (torch.sin(theta) * torch.cos(phi)).view(1, -1)
+    # y = (torch.sin(theta) * torch.sin(phi)).view(1, -1)
+    # z = (torch.cos(theta)).view(1, -1)
+    # return torch.vstack((x,y,z))
 
 
-def cartesian_to_spherical(x, y, z):
-    rho = np.sqrt(x**2 + y**2 + z**2)
-    theta = np.arccos(z / rho)
-    phi = np.arctan2(y, x)
-    return theta, phi
+def cartesian_to_spherical(xyz):
+    x, y, z = xyz.unbind(-1)
+    rho = torch.norm(xyz, dim=-1, keepdim=False)
+    theta = torch.acos(z / rho)
+    phi = torch.atan2(y, x)
+
+    return torch.stack([theta, phi], dim=-1)
+    # rho = np.sqrt(x**2 + y**2 + z**2)
+    # theta = np.arccos(z / rho)
+    # phi = np.arctan2(y, x)
+    # return theta, phi
 
 
 def local_to_world_rotation(target_dir):
@@ -105,24 +120,38 @@ def local_to_world_rotation(target_dir):
     (where +z is aligned with `target_dir`) to world coordinates.
     
     Args:
-        target_dir (np.ndarray): [3,] The direction vector in world coordinates (e.g., [a, b, c]).
+        target_dir (torch.tensor): (N, 3) The direction vector in world coordinates (e.g., [a, b, c]).
     
     Returns:
-        R (np.ndarray): [3,3] Rotation matrix.
+        R (np.ndarray): (N,3,3) Rotation matrix.
     """
-    target_dir = target_dir / np.linalg.norm(target_dir) # make sure unitvec
+    target_dir = target_dir / torch.norm(target_dir, dim=-1, keepdim=True) # make sure unitvec
     
-    temp_up = np.array([0, 0, 1], dtype=np.float32)
-    if np.abs(np.dot(target_dir, temp_up)) > 0.9:
-        temp_up = np.array([0, 1, 0], dtype=np.float32)  # Fallback
-    
-    tangent = np.cross(target_dir, temp_up)
-    tangent = tangent / np.linalg.norm(tangent)
-    bitangent = np.cross(target_dir, tangent)
-    bitangent = bitangent / np.linalg.norm(bitangent)
+    temp_up = torch.zeros_like(target_dir, dtype=torch.float32)
+    temp_up[..., 2] = 1.0
+    # if np.abs(np.dot(target_dir, temp_up)) > 0.9:
+    #     temp_up = np.array([0, 1, 0], dtype=np.float32)  # Fallback
 
-    R = np.stack([tangent, bitangent, target_dir], axis=1, dtype=np.float32)
-    return torch.as_tensor(R)
+    tangent = torch.where(
+        (torch.abs(target_dir[..., 2]) > 0.9).unsqueeze(-1),
+        torch.cross(target_dir, temp_up, dim=-1),
+        torch.cross(target_dir, temp_up, dim=-1)
+    )
+    tangent = tangent / torch.norm(tangent, dim=-1, keepdim=True)
+    
+    # Compute bitangent and normalize
+    bitangent = torch.cross(target_dir, tangent, dim=-1)
+    bitangent = bitangent / torch.norm(bitangent, dim=-1, keepdim=True)
+    
+    # Stack to create rotation matrices
+    return torch.stack([tangent, bitangent, target_dir], dim=-1).type(dtype=torch.float32)
+    # tangent = np.cross(target_dir, temp_up)
+    # tangent = tangent / np.linalg.norm(tangent)
+    # bitangent = np.cross(target_dir, tangent)
+    # bitangent = bitangent / np.linalg.norm(bitangent)
+
+    # R = np.stack([tangent, bitangent, target_dir], axis=1, dtype=np.float32)
+    # return torch.as_tensor(R)
 
 
 def camera_extrinsics(q, t):
