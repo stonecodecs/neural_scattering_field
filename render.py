@@ -3,8 +3,9 @@ import torch
 import torch.nn as nn
 import numpy as np
 from typing import Union, Optional, Tuple, Callable
-from utils import prepare_chunks
-from sh import project_to_sh
+from utils import prepare_chunks, local_to_world_rotation, spherical_to_cartesian
+from sh import project_to_sh, sh_basis, sample_henyey_greenstein, \
+        sample_isotropic, isotropic_pdf, henyey_greenstein_pdf
 
 
 def lerp(
@@ -168,21 +169,74 @@ def sample_rays(
     return samples_3d, z_vals
 
 
+def eval_sh(coefs, d, lmax=2, polar=True):
+    """ Get radiance of SH lighting from direction d, given its coefficients. """
+    # NOTE: make sure that the direction 'd' is world coordinates
+    # an easy to miss bug would be using a direction straight from a sampler (still in ray coordinates)
+
+    # lmax and coefs need to correspond to each other
+    if polar:
+        theta, phi = d[..., 0], d[..., 1]
+    else: # Cartesian
+        x, y, z = d[..., 0], d[..., 1], d[..., 2]
+        theta = torch.acos(z)
+        phi = torch.atan2(y,x)
+
+    L = 0.0  # radiance
+    for l in range(lmax + 1):
+        for m in range(-l, l + 1):
+            Y = sh_basis(l, m, theta, phi)
+            index = l * (l + 1) + m   # flattened idx
+            L += coefs[index] * Y
+    return L
+
+
+def sample_next_directions(ray_dir, phase_function, num_samples):
+    """
+    Samples a random direction given a phase function.
+    Automatically converts into world coordinates. 
+    (Might need to implement for batching? Maybe `vmap` will work.)
+
+    Args:
+        ray_dir (3 vector): current direction of the main ray before scattering (3,)
+        phase_function (function): phase function that takes in UV random [0,1] values
+        num_samples (int): Number of directions to sample.
+
+    Returns:
+        Sample directions in shape (3, N).
+    """
+    R = local_to_world_rotation(ray_dir)
+    theta, phi = phase_function(*torch.rand(2, num_samples)) # w.r.t the current ray direction
+    sample_dirs = R @ spherical_to_cartesian(theta, phi)
+    return sample_dirs  # (3, num_samples) matrix
+
+
 def single_scatter():
     """
-    Returns the light contribution from importance sampling the 
+    Returns the approximate light contribution using HG phase function to "query" the environment map.
     """
     # TODO
     pass
 
 
-def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, g: float, num_samples=64):
+def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, ray_dir: torch.Tensor, num_samples=64):
     """
     Returns the approximate light contribution in the direction of omega_out (from light to eye)
-    using the raw spherical harmonics predicted coefficients from SHNet
+    using the raw spherical harmonics predicted coefficients from SHNet.
+    
+    Args:
+        sh_coefs (torch.Tensor): Outputs from SH MLP
+        sigma_s (float): Scattering Coefficient from ScatterMLP
+        current_dir (Tensor): current ray direction
+        num_samples (int, optional): Number of samples used to evaluate radiance. Defaults to 64.
+
+    Returns:
+        Radiance estimated from Monte Carlo (3,) for RGB
     """
-    # TODO
-    pass
+    sample_dirs = sample_next_directions(ray_dir, phase_function=sample_isotropic, num_samples=num_samples)
+    L_sh = eval_sh(sh_coefs, sample_dirs, polar=False)  # get radiance of light at point in the map
+    return (L_sh * sigma_s / isotropic_pdf()).mean(dim=0)
+
 
 def volume_render(
     raw: torch.tensor,
@@ -268,12 +322,12 @@ def volume_render(
     return rgb_map, acc_map, weights, depth_map
 
 
-def sample_pdf(
-        bins: torch.tensor,
-        weights: torch.tensor,
-        num_samples: int,
-        perturb: bool=True,
-        batched: bool=False
+def sample_fine(
+    bins: torch.tensor,
+    weights: torch.tensor,
+    num_samples: int,
+    perturb: bool=True,
+    batched: bool=False
 )-> torch.tensor:
     """
     Performs inverse transform sampling to sample from a PDF based on `weights`
@@ -301,7 +355,7 @@ def sample_pdf(
 
     if batched:
         batched_sample_pdf = torch.vmap(
-            sample_pdf, 
+            sample_fine, 
             in_dims=(0,0), randomness='different')
         return batched_sample_pdf(
             bins, weights, 
@@ -352,13 +406,13 @@ def sample_pdf(
 
 
 def sample_hierarchical(
-        rays_o: torch.tensor,
-        rays_d: torch.tensor,
-        z_vals: torch.tensor,
-        weights: torch.tensor,
-        num_samples: int,
-        perturb: bool=True,
-        batched: bool=False,
+    rays_o: torch.tensor,
+    rays_d: torch.tensor,
+    z_vals: torch.tensor,
+    weights: torch.tensor,
+    num_samples: int,
+    perturb: bool=True,
+    batched: bool=False,
 ) -> Tuple[torch.tensor, torch.tensor, torch.tensor]:
     """
     Performs hierarchical sampling (for NeRF fine-pass) for importance sampling
@@ -375,8 +429,8 @@ def sample_hierarchical(
     weights : torch.tensor
         Weights of coarse samples along rays (given by volume rendering). ([N,] H, W, S)
     num_samples : int
-        Number of samples to take from the distribution given by weights.
-        (See: `sample_pdf`)
+        Number of samples to take from the distribution (histogram) given by weights.
+        (See: `sample_fine`)
     perturb : bool, optional
         Generate samples randomly (otherwise, linearly), by default True
     batched : bool, optional
@@ -392,7 +446,7 @@ def sample_hierarchical(
 
     # inverse transform sampling
     bins = (z_vals[..., 1:] + z_vals[..., :-1]) / 2
-    fine_z_samples = sample_pdf(
+    fine_z_samples = sample_fine(
         bins, weights[..., 1:-1],
         num_samples=num_samples, perturb=perturb, batched=batched) 
     fine_z_samples = fine_z_samples.detach()
@@ -404,21 +458,23 @@ def sample_hierarchical(
     
 
 def nerf_forward(
-  rays_o: torch.Tensor,
-  rays_d: torch.Tensor,
-  near: float,
-  far: float,
-  encoding_fn: Callable[[torch.Tensor], torch.Tensor],
-  coarse_model: nn.Module,
-  kwargs_sample_stratified: dict = None,
-  n_samples_hierarchical: int = 0,
-  kwargs_sample_hierarchical: dict = None,
-  fine_model = None,
-  viewdirs_encoding_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-  chunk_size: int = 2**15
+    # from get_rays
+    rays_o: torch.Tensor,
+    rays_d: torch.Tensor,
+    near: float,
+    far: float,
+    # PE function
+    encoding_fn: Callable[[torch.Tensor], torch.Tensor],
+    coarse_model: nn.Module, # NeRF using sample_rays only
+    fine_model = None, # NeRF using sample_rays + sample_fine (bundled by sample_hierarchical)
+    kwargs_sample_stratified: dict = None,
+    n_samples_hierarchical: int = 0,
+    kwargs_sample_hierarchical: dict = None,
+    viewdirs_encoding_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    chunk_size: int = 2**15
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     """
-    NeRF forward pass. (So far, only takes non-batched data)
+    NeRF forward pass.
 
     Parameters
     ----------
@@ -444,6 +500,7 @@ def nerf_forward(
         Fine model (augments coarse model with hierarcihcal sampling step), by default None
     viewdirs_encoding_fn : Optional[Callable[[torch.Tensor], torch.Tensor]], optional
         Positional encoding function for view directions, by default None
+        NOTE: However, should be used!
     chunksize : int, optional
         Chunk size, by default 2**15
 
@@ -455,7 +512,7 @@ def nerf_forward(
         - key 'acc_map'
         - key 'weights'
     """
-    # TODO: enable batching 
+
     H, W = rays_o.shape[:2]
     S_coarse = kwargs_sample_stratified.get('num_samples', 64)
     S_fine   = n_samples_hierarchical
@@ -488,6 +545,7 @@ def nerf_forward(
     # with torch.no_grad():
     #   print(f"RAW{raw.shape}:\nMEAN:{torch.mean(raw.reshape(-1,4), dim=0)}")
 
+    # TODO: IMPORTANT -- volume_render should use networks from ms_nerf.py
     rgb_map, acc_map, weights, depth_map = volume_render(raw, z_vals, rays_d)
 
     # FINE pass predictions; process is basically the same as coarse pass
@@ -527,3 +585,40 @@ def nerf_forward(
     outputs['weights'] = weights
     
     return outputs
+
+
+# phase functions
+def sample_isotropic(u, v):
+    """
+    Sample uniformly across the sphere. 
+    Returns theta, phi.
+    NOTE: when using with sampling, the result is in RAY coordinates. Change to world coordinates.
+    """
+    theta = np.arccos(np.clip(2 * u - 1, -1, 1))
+    phi = 2 * np.pi * v
+    return theta, phi
+
+
+def isotropic_pdf(x=0):
+    return np.full(len(x), 1 / (4 * np.pi))
+
+
+def sample_henyey_greenstein(u, v, g):
+    """
+    HG phase function parametrized by 'g' ranging from [-1, 1]. 
+    NOTE: when using with sampling, the result is in RAY coordinates. Change to world coordinates.
+    """
+    # u is "cos_theta" in HG
+    # g: Asymmetry parameter (-1 is full back-scattering, 1 is full frontal scattering)
+    if g == 0: # isotropic, avoid 0 denom
+        cos_theta = 2 * u - 1 
+    else:
+        # HG CDF
+        cos_theta = (1 + g**2 - ((1 - g**2) / (1 - g + 2 * g * u))**2) / (2 * g)
+    
+    theta = np.arccos(np.clip(cos_theta, -1, 1))
+    phi = 2 * np.pi * v
+    return theta, phi
+
+def henyey_greenstein_pdf(cos_theta, g):
+    return (1 - g**2) / (4 * np.pi * (1 + g**2 - 2 * g * cos_theta)**(3/2))

@@ -1,47 +1,70 @@
 ## network modules
-# import tinycudann as tcnn   # only works for T4 GPU in colab
+# import tinycudann as tcnn   # only works for T4 GPU in colab 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# if using tinycudann, uncomment the related region of code per class
+
+def create_mlp(input_dim, latent_dim, output_dim, num_layers,
+               output_activation=None, activation=nn.ReLU):
+    layers = [nn.Sequential(nn.Linear(latent_dim if i > 0 else input_dim, latent_dim), activation())
+              for i in range(num_layers - 1)]
+    layers.append(nn.Linear(latent_dim, output_dim))
+    if output_activation is not None:
+        layers.append(output_activation())
+    return nn.Sequential(*layers)
+
+# def create_tinycudann_mlp(input_dim, latent_dim, output_dim, num_layers,
+#                           output_activation="None", activation="ReLU"):
+#     return tcnn.Network(
+#         n_input_dims=input_dim,
+#         n_output_dims=output_dim,
+#         network_config={
+#             "otype": "FullyFusedMLP",  # Fully fused MLP for speed
+#             "activation": activation,  # ReLU for hidden layers
+#             "output_activation": output_activation,  # No activation at output
+#             "n_neurons": latent_dim,  # Number of neurons per hidden layer
+#             "n_hidden_layers": num_layers,  # Four hidden layers
+#         }
+#     )
+
 # Traditional PE used in NeRF.
-# If used with TensoRF, we won't use this. 
+# If using TensoRF, we won't use this. 
 # Also, Fourier Feature Transforms may be better.
 class PositionalEncoder(nn.Module):
-    def __init__(self, input_dim, num_freqs):
+    def __init__(self, input_dim, encoding_dim, log_space=False, **kwargs):
         super().__init__()
-        self.freq_bands = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs)
-        self.out_dim = input_dim * 2 * num_freqs  # Sine and cosine for each frequency
+        self.input_dim = input_dim
+        self.encoding_dim = encoding_dim
+        self.log_space = log_space
+        self.funcs = [lambda x: x] if kwargs.get("include_input", True) else []
+        self.output_dim = input_dim * (len(self.funcs) + 2 * encoding_dim)
+        self.device = kwargs.get("device", "cuda")
 
-    def forward(self, x):
-        encoded = []
-        for freq in self.freq_bands:
-            encoded.append(torch.sin(freq * x))
-            encoded.append(torch.cos(freq * x))
-        return torch.cat(encoded, dim=-1)
+        if self.log_space:
+            freqs = 2.0 ** torch.linspace(0.0, self.encoding_dim - 1, encoding_dim, device=self.device)
+        else: # linear space
+            freqs = torch.linspace(2.0 ** 0, 2.0 ** (self.encoding_dim - 1), self.encoding_dim, device=self.device)
+
+        for freq in freqs:
+            # alternate between cos/sin
+            self.funcs.append(lambda x, freq=freq: torch.sin(x * freq))
+            self.funcs.append(lambda x, freq=freq: torch.cos(x * freq))
+
+    def forward(self, v):
+        # 'v' is (HWN, 3), or flattened 3D positions of samples
+        # resulting dim should be (2 * encoding_dim + 1)
+        return torch.concat([func(v) for func in self.funcs], dim=-1)
 
 
 # Intermediate Feature Network
 class FeatureMLP(nn.Module):
     # input dimension dim_x should be post-PE
-    def __init__(self, dim_x=3, dim_z=256, num_freqs=8):
+    def __init__(self, dim_x=3*2*8, dim_z=256, dim_out=256, num_layers=8):
         super().__init__()
-        self.encoder = PositionalEncoder(dim_x, num_freqs)
-        self.mlp = nn.Sequential(
-            *[nn.Sequential(nn.Linear(256 if i > 0 else self.encoder.out_dim, 256), nn.ReLU())
-              for i in range(8)]  # 8 layers
-        )
-        # self.mlp = tcnn.Network(
-        #     n_input_dims=dim_x,
-        #     n_output_dims=dim_z,
-        #     network_config={
-        #         "otype": "FullyFusedMLP",  # Fully fused MLP for speed
-        #         "activation": "ReLU",  # ReLU for hidden layers
-        #         "output_activation": "None",  # No activation at output
-        #         "n_neurons": 256,  # Number of neurons per hidden layer
-        #         "n_hidden_layers": 8,  # Four hidden layers
-        #     }
-        # )
+        self.mlp = create_mlp(dim_x, dim_z, dim_out, num_layers=num_layers)
+        # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers)
 
     def forward(self, x):
         x_encoded = self.encoder(x)
@@ -50,56 +73,29 @@ class FeatureMLP(nn.Module):
 
 # Scatter Network gets sigma_t, sigma_s, 'g'
 class ScatterMLP(nn.Module):
-    # outputs [sigma_s (1), sigma_s (3), Henyey-Greenstein parameter 'g' (1)]
-    def __init__(self, input_dim=256):
+    # outputs [sigma_s, sigma_s, HG parameter 'g']
+    def __init__(self, dim_x=256, dim_z=128, dim_out=3, num_layers=1):
         super().__init__()
-        self.layer = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 5)
-        )
-        # self.mlp = tcnn.Network(
-        #     n_input_dims=input_dim,
-        #     n_output_dims=5,
-        #     network_config={
-        #         "otype": "FullyFusedMLP",  # Fully fused MLP for speed
-        #         "activation": "ReLU",  # ReLU for hidden layers
-        #         "output_activation": "None",  # No activation at output
-        #         "n_neurons": 128,  # Number of neurons per hidden layer
-        #         "n_hidden_layers": 1,  # Four hidden layers
-        #     }
-        # )
+        self.mlp = create_mlp(dim_x, dim_z, dim_out, num_layers=num_layers)
+        # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers)
 
     def forward(self, features):
         output = self.layer(features)
-        sigma_t = torch.relu(output[:, 0])  # Extinction coefficient (σ ≥ 0)
-        sigma_s = torch.sigmoid(output[:, 1:4])  # RGB albedo ∈ [0, 1]
-        g = torch.tanh(output[:, 4])  # Asymmetry parameter ∈ [-1, 1]
+        sigma_t = torch.relu(output[:, 0])  # extinction
+        sigma_s = torch.relu(output[:, 1])  # scattering
+        g = torch.tanh(output[:, 2])  # g [-1, 1]
         return sigma_t, sigma_s, g
 
 
 # SH coefficient predictor MLP
 class SphericalHarmonicsMLP(nn.Module):
-    def __init__(self, input_dim=256, l_max=5):
+    # outputs SH coefficients
+    def __init__(self, dim_x=256, dim_z=128, num_layers=8, lmax=2):
         super().__init__()
-        self.l_max = l_max
-        self.num_coef = (l_max + 1) ** 2  # num of SH coefficients
-        self.mlp = nn.Sequential(
-            *[nn.Sequential(nn.Linear(128 if i > 0 else input_dim, 128), nn.ReLU())
-              for i in range(8)],  # 8 layers
-            nn.Linear(128, 3 * self.num_coef)  # RGB coefficients
-        )
-        # self.mlp = tcnn.Network(
-        #     n_input_dims=input_dim,
-        #     n_output_dims=3 * self.num_coef,
-        #     network_config={
-        #         "otype": "FullyFusedMLP",  # Fully fused MLP for speed
-        #         "activation": "ReLU",  # ReLU for hidden layers
-        #         "output_activation": "None",  # No activation at output
-        #         "n_neurons": 128,  # Number of neurons per hidden layer
-        #         "n_hidden_layers": 8,  # Four hidden layers
-        #     }
-        # )
+        self.lmax = lmax
+        self.num_coef = (lmax + 1) ** 2  # num of SH coefficients (* 3 for RGB later)
+        self.mlp = create_mlp(dim_x, dim_z, self.num_coef * 3, num_layers=num_layers)
+        # self.mlp = create_tinycudann_mlp(dim_x, dim_z, self.num_coef * 3, num_layers)
 
     def forward(self, features):
         sh_coeffs = self.mlp(features)
@@ -108,28 +104,12 @@ class SphericalHarmonicsMLP(nn.Module):
 
 # Predicts transmittance T
 class VisibilityMLP(nn.Module):
-    def __init__(self, pos_dim=3, dir_dim=3, pos_freqs=8, dir_freqs=1):
+    # Expects PE encoded position and dimensional vectors; takes in as input their concatenated vector
+    def __init__(self, posenc_dim, direnc_dim, dim_z=256, dim_out=1, num_layers=4):
         super().__init__()
-        self.pos_encoder = PositionalEncoder(pos_dim, pos_freqs)
-        self.dir_encoder = PositionalEncoder(dir_dim, dir_freqs)
-        input_dim = self.pos_encoder.out_dim + self.dir_encoder.out_dim
-        self.mlp = nn.Sequential(
-            *[nn.Sequential(nn.Linear(256 if i > 0 else input_dim, 256), nn.ReLU())
-              for i in range(4)],  # 4 layers
-            nn.Linear(256, 1),
-            nn.Sigmoid()  # Transmittance τ ∈ [0, 1]
-        )
-        # self.mlp = tcnn.Network(
-        #     n_input_dims=input_dim,
-        #     n_output_dims=1,
-        #     network_config={
-        #         "otype": "FullyFusedMLP",  # Fully fused MLP for speed
-        #         "activation": "ReLU",  # ReLU for hidden layers
-        #         "output_activation": "None",  # No activation at output
-        #         "n_neurons": 256,  # Number of neurons per hidden layer
-        #         "n_hidden_layers": 4,  # Four hidden layers
-        #     }
-        # )
+        input_dim = posenc_dim + direnc_dim
+        self.mlp = create_mlp(input_dim, dim_z, dim_out, num_layers=num_layers, output_activation=nn.Sigmoid)
+        # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers, output_activation="Sigmoid")
 
     def forward(self, x, d):
         pos_enc = self.pos_encoder(x)
@@ -137,32 +117,58 @@ class VisibilityMLP(nn.Module):
         x = torch.cat([pos_enc, dir_enc], dim=-1)
         return self.mlp(x).squeeze(-1)
 
-# multiple scattering NeRF
-class NeuralScatteringField(nn.Module):
-    def __init__(self,
-        enc_pos=PositionalEncoder(3, 8),
-        enc_dir=PositionalEncoder(2, 1),
-        visibility_network=VisibilityMLP(),
-        feature_network=FeatureMLP(),
-        sh_network=SphericalHarmonicsMLP(),
-        main_network=ScatterMLP()
-    ):
-        super().__init__()
-        self.enc_pos = enc_pos
-        self.enc_dir = enc_dir
-        self.V = visibility_network
-        self.F = feature_network
-        self.SH = sh_network
-        self.M = main_network
 
-    def forward(self, x, d):
-        x_encoded = self.enc_pos(x)
-        d_encoded = self.enc_dir(d)
-        T_pred = self.V(x_encoded, d_encoded)
-        feats = self.F(x_encoded)
-        sh_coefs = self.SH(feats)
-        # multiple scatter function(sh_coefs, g, sigma_s)
-        sigma_t, sigma_s, g = self.M(feats) # extinction, scatter, HG coefficients
-        # single scatter function(all output from self.M)
-        # return single + multi (image prediction)
+# DEPRECATED -- decoupling is best
+# class NeuralScatteringField(nn.Module):
+#     def __init__(self,
+#         env_map, # requires lighting
+#         enc_pos=PositionalEncoder(3, 8),
+#         enc_dir=PositionalEncoder(3, 1),
+#         visibility_network=VisibilityMLP(),
+#         feature_network=FeatureMLP(),
+#         sh_network=SphericalHarmonicsMLP(),
+#         main_network=ScatterMLP(),
+#         num_samples=64
+#     ):
+#         super().__init__()
+#         self.env_map = env_map
+#         self.enc_pos = enc_pos
+#         self.enc_dir = enc_dir
+#         self.F = feature_network
+#         self.S = sh_network
+#         self.M = main_network
+#         self.num_samples = num_samples
+
+#     def single_scatter(self, x, d, sigma_s, sigma_t, g):
+#         # single scattering samples
+#         pass
+
+#     def forward(self, x, d):
+#         # this should only output: sigma_s, sigma_t, g, sh_coefs
+
+#         # SH coefficinets from S
+
+#         # get rgb from ray marching (volume rendering)
+
+#         # return rgb, s_t, s_s, g, sh_coeffs
+#         # should output: rgb (for loss), s_t, s_s, g, coefs, That
+#         x_encoded = self.enc_pos(x)
+#         d_encoded = self.enc_dir(d)
+#         T_pred = self.V(x_encoded, d_encoded)
+#         feats = self.F(x_encoded)
+#         sh_coefs = self.SH(feats)
+
+#         # visibility branch
+#         T = self.V(x_encoded, d_encoded) # "transmittance given a direction @ x"
+        
+
+#         # main branch
+#         # multiple scatter function(sh_coefs, g, sigma_s)
+#         sigma_t, sigma_s, g = self.M(feats) # extinction, scatter, HG coefficients
+
+
+#         # single scatter function(all output from self.M)
+
+
+#         # return single + multi (image prediction)
 

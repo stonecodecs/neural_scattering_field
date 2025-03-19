@@ -80,6 +80,51 @@ def quaternion_to_rotation_matrix(q):
         [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)]
   ])
 
+def spherical_to_cartesian(theta, phi):
+    """
+    From theta, phi in spherical coordinates, convert to a Cartesian 3D directional vector.
+
+    """
+    theta, phi = torch.as_tensor(theta), torch.as_tensor(phi)
+    x = (torch.sin(theta) * torch.cos(phi)).view(1, -1)
+    y = (torch.sin(theta) * torch.sin(phi)).view(1, -1)
+    z = (torch.cos(theta)).view(1, -1)
+    return torch.vstack((x,y,z))
+
+
+def cartesian_to_spherical(x, y, z):
+    rho = np.sqrt(x**2 + y**2 + z**2)
+    theta = np.arccos(z / rho)
+    phi = np.arctan2(y, x)
+    return theta, phi
+
+
+def local_to_world_rotation(target_dir):
+    """
+    Constructs a rotation matrix to convert directions from a local coordinate system 
+    (where +z is aligned with `target_dir`) to world coordinates.
+    
+    Args:
+        target_dir (np.ndarray): [3,] The direction vector in world coordinates (e.g., [a, b, c]).
+    
+    Returns:
+        R (np.ndarray): [3,3] Rotation matrix.
+    """
+    target_dir = target_dir / np.linalg.norm(target_dir) # make sure unitvec
+    
+    temp_up = np.array([0, 0, 1], dtype=np.float32)
+    if np.abs(np.dot(target_dir, temp_up)) > 0.9:
+        temp_up = np.array([0, 1, 0], dtype=np.float32)  # Fallback
+    
+    tangent = np.cross(target_dir, temp_up)
+    tangent = tangent / np.linalg.norm(tangent)
+    bitangent = np.cross(target_dir, tangent)
+    bitangent = bitangent / np.linalg.norm(bitangent)
+
+    R = np.stack([tangent, bitangent, target_dir], axis=1, dtype=np.float32)
+    return torch.as_tensor(R)
+
+
 def camera_extrinsics(q, t):
   """
   Given quaternion q and translation t, produces a 4x4 matrix representing
@@ -89,7 +134,6 @@ def camera_extrinsics(q, t):
   mat = np.eye(4) # 4x4
   mat[:3, :3] = R
   mat[:3, 3]  = t
-  
   return mat
 
 

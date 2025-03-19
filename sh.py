@@ -4,6 +4,7 @@ from PIL import Image
 from scipy.special import factorial, lpmv
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from render import isotropic_pdf, sample_isotropic, henyey_greenstein_pdf, sample_henyey_greenstein
 
 def sh_basis(l, m, theta, phi):
     if m > 0:
@@ -17,38 +18,6 @@ def sh_basis(l, m, theta, phi):
 # normalization constant for SH basis
 def K(l, m):
     return np.sqrt((2*l+1)/(4*np.pi) * factorial(l-m) / factorial(l+m))
-
-
-def sample_isotropic(u, v):
-    """
-    Sample uniformly across the sphere. 
-    Returns theta, phi.
-    """
-    theta = np.arccos(np.clip(2 * u - 1, -1, 1))
-    phi = 2 * np.pi * v
-    return theta, phi
-
-
-def isotropic_pdf(x):
-    return np.full(len(x), 1 / (4 * np.pi))
-
-
-def sample_henyey_greenstein(u, v, g):
-    """ HG phase function parametrized by 'g' ranging from [-1, 1]. """
-    # u is "cos_theta" in HG
-    # g: Asymmetry parameter (-1 is full back-scattering, 1 is full frontal scattering)
-    if g == 0: # isotropic, avoid 0 denom
-        cos_theta = 2 * u - 1 
-    else:
-        # HG CDF
-        cos_theta = (1 + g**2 - ((1 - g**2) / (1 - g + 2 * g * u))**2) / (2 * g)
-    
-    theta = np.arccos(np.clip(cos_theta, -1, 1))
-    phi = 2 * np.pi * v
-    return theta, phi
-
-def henyey_greenstein_pdf(cos_theta, g):
-    return (1 - g**2) / (4 * np.pi * (1 + g**2 - 2 * g * cos_theta)**(3/2))
 
 
 # Project environment map to SH
