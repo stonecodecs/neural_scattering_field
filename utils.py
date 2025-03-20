@@ -249,18 +249,29 @@ def retrieve_sfm_data(camera_path: str, images_path: str, multi_cam=False):
     return poses, focal_len
 
 
-def ray_plot(origins, directions, arrow_length=0.5) -> None:
+def ray_plot(origins, directions) -> None:
     fig = plt.figure(figsize=(5, 5))
-    ax  = fig.add_subplot(projection='3d')
-    
-    _ = ax.quiver(
-    origins[..., 0].flatten(),
-    origins[..., 1].flatten(),
-    origins[..., 2].flatten(), # x,y,z ray origins
-    directions[..., 0].flatten(),
-    directions[..., 1].flatten(),
-    directions[..., 2].flatten(), length=arrow_length, normalize=True) # u,v,w directions
+    ax = fig.add_subplot(projection='3d')
+
+    # Compute axis limits to ensure equal scaling
+    max_origin = torch.max(torch.abs(origins)).item()
+    max_limit = max(max_origin, 1.0)  # Ensure at least [-1, 1] range if origins are near zero
+
+    ax.set_xlim(-max_limit, max_limit)
+    ax.set_ylim(-max_limit, max_limit)
+    ax.set_zlim(-max_limit, max_limit)
+
+    ax.quiver(
+        origins[..., 0].flatten(),
+        origins[..., 1].flatten(),
+        origins[..., 2].flatten(),
+        directions[..., 0].flatten(),
+        directions[..., 1].flatten(),
+        directions[..., 2].flatten(),
+        length=0.5,
+        normalize=False
+    )
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
-    ax.set_zlabel('z')
+    ax.set_zlabel('Z')
     plt.show()
