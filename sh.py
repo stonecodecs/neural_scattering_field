@@ -4,7 +4,7 @@ from PIL import Image
 from scipy.special import factorial, lpmv
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from render import isotropic_pdf, sample_isotropic, henyey_greenstein_pdf, sample_henyey_greenstein
+
 
 def sh_basis(l, m, theta, phi):
     if m > 0:
@@ -24,10 +24,10 @@ def K(l, m):
 # lmax=2 (9 coefficients is enough for SH lighting)
 def project_to_sh(
     env_map,
+    phase_function,
+    sample_pdf,
     lmax=2,
     num_samples=64,
-    phase_function=sample_isotropic,
-    sample_pdf=isotropic_pdf
 ):
     """
     Projects environment map into spherical harmonic coefficients.
@@ -104,13 +104,6 @@ def reconstruct_sh_image(sh_coeffs, lmax, output_shape=(256, 512)):
             recon_image += Y[..., np.newaxis] * coeff
     
     return recon_image
-
-
-def gen_HG_pair(g):
-    """ Helper function to quickly generate HG(g) and its PDF(g). """
-    hg  = lambda u,v,g=g: sample_henyey_greenstein(u,v,g)
-    pdf = lambda   x,g=g: henyey_greenstein_pdf(x, g)
-    return hg, pdf
 
 
 def plot_sh_texture(recon_image):

@@ -129,8 +129,6 @@ def local_to_world_rotation(target_dir):
     
     temp_up = torch.zeros_like(target_dir, dtype=torch.float32)
     temp_up[..., 2] = 1.0
-    # if np.abs(np.dot(target_dir, temp_up)) > 0.9:
-    #     temp_up = np.array([0, 1, 0], dtype=np.float32)  # Fallback
 
     tangent = torch.where(
         (torch.abs(target_dir[..., 2]) > 0.9).unsqueeze(-1),
@@ -145,13 +143,6 @@ def local_to_world_rotation(target_dir):
     
     # Stack to create rotation matrices
     return torch.stack([tangent, bitangent, target_dir], dim=-1).type(dtype=torch.float32)
-    # tangent = np.cross(target_dir, temp_up)
-    # tangent = tangent / np.linalg.norm(tangent)
-    # bitangent = np.cross(target_dir, tangent)
-    # bitangent = bitangent / np.linalg.norm(bitangent)
-
-    # R = np.stack([tangent, bitangent, target_dir], axis=1, dtype=np.float32)
-    # return torch.as_tensor(R)
 
 
 def camera_extrinsics(q, t):
@@ -183,9 +174,11 @@ def get_images_from_folder(path, scale_to=None):
 def load_transforms_json(json_path: str, filename: str):
     """
     Load transforms_train.json data into PyTorch tensors.
+    Follows Instant-NGP json standard (includes all camera intrinsics)
 
     Args:
         json_path (str): File path to the transforms_train.json file.
+        filename (str): name of transforms file.
 
     Returns:
         dict: A dictionary containing:
@@ -198,10 +191,14 @@ def load_transforms_json(json_path: str, filename: str):
         data = json.load(f)
 
     poses = []
-    first_img_path = data["frames"][0]["file_path"]
-    first_img = Image.open(os.path.join(first_img_path + ".png"))
-    W, H = first_img.size
-    focal_x, focal_y = compute_focal_length(data['camera_angle_x'], (H,W)) # (1,)
+    # first_img_path = data["frames"][0]["file_path"]
+    # if first_img_path.endswith(".png"):
+    #     first_img = Image.open(os.path.join(first_img_path.replace('\\', '/')))
+    # else:
+    #     first_img = Image.open(os.path.join(first_img_path.replace('\\', '/') + ".png"))
+    # W, H = first_img.size
+    # focal_x, focal_y = compute_focal_length(data['camera_angle_x'], (H,W)) # (1,)
+    focal_x, focal_y = data["fl_x"], data["fl_y"]
     for frame in data['frames']:
         transform_matrix = torch.tensor(frame['transform_matrix'], dtype=torch.float32)  # (4,4)
         poses.append(transform_matrix)
@@ -251,16 +248,27 @@ def retrieve_sfm_data(camera_path: str, images_path: str, multi_cam=False):
 
 def ray_plot(origins, directions) -> None:
     fig = plt.figure(figsize=(5, 5))
-    ax  = fig.add_subplot(projection='3d')
-    
-    _ = ax.quiver(
-    origins[..., 0].flatten(),
-    origins[..., 1].flatten(),
-    origins[..., 2].flatten(), # x,y,z ray origins
-    directions[..., 0].flatten(),
-    directions[..., 1].flatten(),
-    directions[..., 2].flatten(), length=0.5, normalize=True) # u,v,w directions
+    ax = fig.add_subplot(projection='3d')
+
+    # Compute axis limits to ensure equal scaling
+    max_origin = torch.max(torch.abs(origins)).item()
+    max_limit = max(max_origin, 1.0)  # Ensure at least [-1, 1] range if origins are near zero
+
+    ax.set_xlim(-max_limit, max_limit)
+    ax.set_ylim(-max_limit, max_limit)
+    ax.set_zlim(-max_limit, max_limit)
+
+    ax.quiver(
+        origins[..., 0].flatten(),
+        origins[..., 1].flatten(),
+        origins[..., 2].flatten(),
+        directions[..., 0].flatten(),
+        directions[..., 1].flatten(),
+        directions[..., 2].flatten(),
+        length=0.5,
+        normalize=False
+    )
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
-    ax.set_zlabel('z')
+    ax.set_zlabel('Z')
     plt.show()

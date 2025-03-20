@@ -4,8 +4,7 @@ import torch.nn as nn
 import numpy as np
 from typing import Union, Optional, Tuple, Callable
 from utils import prepare_chunks, local_to_world_rotation, spherical_to_cartesian, cartesian_to_spherical
-from sh import project_to_sh, sh_basis, sample_henyey_greenstein, \
-        sample_isotropic, isotropic_pdf, henyey_greenstein_pdf
+from sh import project_to_sh, sh_basis
 
 
 def lerp(
@@ -17,20 +16,114 @@ def lerp(
     return near + (far - near) * t
 
 
-def get_camera_poses(poses: torch.tensor) -> Tuple[torch.tensor, torch.tensor]:
+## phase function stuff
+def sample_isotropic(u, v):
+    """
+    Sample uniformly across the sphere. 
+    Returns theta, phi.
+    NOTE: when using with sampling, the result is in RAY coordinates. Change to world coordinates.
+    """
+    theta = np.arccos(np.clip(2 * u - 1, -1, 1))
+    phi = 2 * np.pi * v
+    return torch.stack([theta, phi], dim=-1)
+
+
+def isotropic_pdf(x=0):
+    return np.full(len(x), 1 / (4 * np.pi))
+
+
+def sample_henyey_greenstein(u, v, g):
+    """
+    HG phase function parametrized by 'g' ranging from [-1, 1]. (u,v) are uniformly sampled.
+    NOTE: when using with sampling, the result is in RAY coordinates. Change to world coordinates.
+    """
+    # u is "cos_theta" in HG
+    # g: Asymmetry parameter (-1 is full back-scattering, 1 is full frontal scattering)
+    if g == 0: # isotropic, avoid 0 denom
+        cos_theta = 2 * u - 1 
+    else:
+        # HG CDF
+        cos_theta = (1 + g**2 - ((1 - g**2) / (1 - g + 2 * g * u))**2) / (2 * g)
+    
+    theta = np.arccos(np.clip(cos_theta, -1, 1))
+    phi = 2 * np.pi * v
+    return torch.stack([theta, phi], dim=-1)
+
+def henyey_greenstein_pdf(cos_theta, g):
+    return (1 - g**2) / (4 * np.pi * (1 + g**2 - 2 * g * cos_theta)**(3/2))
+
+
+def gen_HG_pair(g):
+    """ Helper function to quickly generate HG(g) and its PDF(g). """
+    hg  = lambda u,v,g=g: sample_henyey_greenstein(u,v,g)
+    pdf = lambda   x,g=g: henyey_greenstein_pdf(x, g)
+    return hg, pdf
+
+
+def get_camera_poses(poses: torch.tensor, transpose=False, normalize=False) -> Tuple[torch.tensor, torch.tensor]:
     """
     Extracts camera origins and -z vectors from 4x4 extrinsic matrices.
 
     Args:
         poses (torch.tensor): Camera poses (N, 4, 4)
-
+        transpose (bool): Depending on the dataset, this is either
+        normalize (bool): normalize translational vectors to the range specified
     Returns:
         torch.tensor: Camera origins (N, 3)
         torch.tensor: Camera directions (-Z unit vectors) (N, 3)
     """
-    cam_origins = poses[..., 0:3, 3] # translation components of matrix
-    cam_directions = -poses[..., 0:3, 2] # equivalent to -z vector [0,0,-1]
-    return cam_origins, cam_directions
+    poses_ = poses.T if transpose else poses # if column-wise
+    cam_origins = poses_[..., 0:3, 3] # translation components of matrix
+    cam_directions = -poses_[..., 0:3, 2] # equivalent to -z vector [0,0,-1]
+    return cam_origins / cam_origins.max() if normalize else cam_origins, cam_directions
+
+
+# def get_camera_poses(
+#     poses: torch.tensor,
+#     transpose: bool = False,
+#     normalize: bool = False,
+#     is_test: bool = False,
+#     center: Optional[torch.tensor] = None,
+#     scale: Optional[float] = None
+# ) -> Tuple[torch.tensor, torch.tensor]:
+#     """
+#     Extracts camera origins and -z vectors from 4x4 extrinsic matrices.
+#
+#     Args:
+#         poses (torch.tensor): Camera poses (N, 4, 4)
+#         transpose (bool): Whether the poses are stored in column-major order.
+#         normalize (bool): If True, normalize the camera origins using the provided center and scale.
+#         is_test (bool): Whether these are test poses (which need their directions re-computed).
+#         center (Optional[torch.tensor]): A (1,3) tensor representing the scene center in world space.
+#         scale (Optional[float]): A scalar to use for normalizing the camera origins.
+#     Returns:
+#         torch.tensor: Camera origins (N, 3)
+#         torch.tensor: Camera directions (-Z unit vectors) (N, 3)
+#     """
+#     poses_ = poses.transpose(-1, -2) if transpose else poses # if column-wise
+#     cam_origins = poses_[..., :3, 3].clone() # translation components of matrix
+#
+#     if normalize and center is not None and scale is not None:
+#         cam_origins = (cam_origins - center) / scale
+#
+#     if not is_test:
+#         # For training, use the -Z axis of the rotation matrix.
+#         cam_directions = -poses_[..., :3, 2]
+#         print(f"Train: {cam_origins[0], cam_directions[0]}")
+#         print(f"Train: {cam_origins[1], cam_directions[1]}")
+#         print(f"Train: {cam_origins[2], cam_directions[2]}")
+#     else:
+#         # For test poses, override the direction.
+#         # After normalization, the scene center is at 0, so we want the camera to look toward the origin.
+#         # That is, the desired direction is -normalized_origin.
+#         diff = -cam_origins
+#         norm = torch.norm(diff, dim=-1, keepdim=True)
+#         cam_directions = diff / (norm + 1e-9)
+#         print(f"Test: {cam_origins[0], cam_directions[0]}")
+#         print(f"Test: {cam_origins[1], cam_directions[1]}")
+#         print(f"Test: {cam_origins[2], cam_directions[2]}")
+#
+#     return cam_origins, cam_directions
 
 
 def get_rays(cam_extrinsics: torch.tensor,
@@ -198,13 +291,13 @@ def eval_env_map(direction, env_map):
     return env_map[pixel_y, pixel_x]
 
 
-def eval_sh(coefs, d, lmax=2, polar=True):
+def eval_sh(coefs, d, lmax=2, spherical=True):
     """ Get radiance of SH lighting from direction d, given its coefficients. """
     # NOTE: make sure that the direction 'd' is world coordinates
     # an easy to miss bug would be using a direction straight from a sampler (still in ray coordinates)
 
     # lmax and coefs need to correspond to each other
-    if polar:
+    if spherical:
         theta, phi = d[..., 0], d[..., 1]
     else: # Cartesian
         x, y, z = d[..., 0], d[..., 1], d[..., 2]
@@ -273,8 +366,9 @@ def single_scatter(
     Returns:
         torch.tensor: radiance (NHW,S,3)
     """
-    # 'g' should be "baked-in" to the 'phase_function' when passing it (..., S, 3)
-    sample_dirs = sample_next_directions(ray_dir, phase_function=phase_function, num_samples=num_samples)
+    # 'g' should be "baked-in" to the 'phase_function' when passing it (..., S, 3) as below
+    hg_for_g = lambda u,v: phase_function(u,v,g)
+    sample_dirs = sample_next_directions(ray_dir, phase_function=hg_for_g, num_samples=num_samples)
     T = visibility_network(torch.full(len(sample_dirs.reshape(-1,3)), x), sample_dirs.reshape(-1, 3)) # (...,3) for both
     cos_theta = torch.sum(ray_dir.view(-1,3) * sample_dirs.view(-1, 3), dim=-1)  # (...) dot product per row
     pdf = torch.nan_to_num(phase_function_pdf(cos_theta, g), nan=1e-6)  # (scalar) NOTE: possibly 1e-6 hardcoded is a bad idea (used to avoid NaN)
@@ -298,8 +392,8 @@ def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, ray_dir: torch.Tensor,
         Radiance estimated from Monte Carlo (3,) for RGB
     """
     sample_dirs = sample_next_directions(ray_dir, phase_function=sample_isotropic, num_samples=num_samples)
-    L_sh = eval_sh(sh_coefs, sample_dirs, polar=False)  # get radiance of light at point in the map
-    return (L_sh * sigma_s / isotropic_pdf()).mean(dim=0)
+    L_sh = eval_sh(sh_coefs, sample_dirs, spherical=False)  # get radiance of light at point in the map
+    return (L_sh * sigma_s / isotropic_pdf()).mean(dim=0)   # (..., 3); T is baked into the learned coefficients
 
 
 def volume_render(
@@ -367,7 +461,7 @@ def volume_render(
     # also, keeps shape consistent with z_vals; eventually gets "rolled" out
 
     # multiply by the direction (NOT unit vectors) norm to get real 3D-scaled distances
-    # in this way, rays extend like a rectangular pyramid instead of a sphere (if unit vec)
+    # in this way, rays extend like a rectangular pyramid instead of a spherical cone (using unit vec)
     # (say norm is sqrt(5); then for every z unit, the distance is sqrt(5) per 'z' traveled)
     delta_z = delta_z * torch.linalg.vector_norm(rays_d.unsqueeze(-2), dim=-1) # (H,W,S)
     noise = 0.0  # optional noise to add to density (following Gaussian)
@@ -383,18 +477,16 @@ def volume_render(
     weights = opacity * acc_T   # used for fine sampling on fine-pass
 
     # transmittance is already applied internally to the functions below
-    Ls = single_scatter(env_map, points, rays_d, sigma_s, visibility_network, num_samples=64)
+    # add the contributions from single and multi scattering cases
+    Ls = single_scatter(env_map, points, rays_d, sigma_s, g_phase_param, visibility_network, num_samples=64)
     Lm = multi_scatter(sh_coefs, sigma_s, rays_d)
     L = Ls + Lm  # output shape: ([N,] H, W, S, 3)
-
+    
     rgb_map = torch.sum(L * weights.unsqueeze(-1), dim=-2) # sum sample contributions ([N,] H, W, 3)
-    depth_map = torch.sum(weights * z_vals, dim=-1)  # this only relies on T, so it's okay to not alter
-    # disp_map = 1.0 / torch.max(1e-10 * torch.ones_like(depth_map), depth_map / torch.sum(weights, dim=-1))
-
-    # weight accumulation; [0,1] where 0 is fully transparent, and 1 is fully absorbed
+    depth_map = torch.sum(weights * z_vals, dim=-1)
+    # weight accumulation; [0,1]
     acc_map = torch.sum(weights, dim=-1)
 
-    # if white background
     if white_background:
         rgb_map = rgb_map + (1.0 - acc_map.unsqueeze(-1))
 
@@ -544,12 +636,13 @@ def nerf_forward(
     far: float,
     # PE function
     encoding_fn: Callable[[torch.Tensor], torch.Tensor],
-    coarse_model: nn.Module, # NeRF using sample_rays only
-    fine_model = None, # NeRF using sample_rays + sample_fine (bundled by sample_hierarchical)
+    coarse_nets: dict[str, nn.Module], # coarse network components
+    fine_nets: dict[str, nn.Module] = None, # coarse + fine samples, fine network components
     kwargs_sample_stratified: dict = None,
     n_samples_hierarchical: int = 0,
     kwargs_sample_hierarchical: dict = None,
     viewdirs_encoding_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    sh_level: int = 2,
     chunk_size: int = 2**15
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     """
@@ -567,16 +660,21 @@ def nerf_forward(
         Far plane.
     encoding_fn : Callable[[torch.Tensor], torch.Tensor]
         Positional encoding function.
-    coarse_model : nn.Module
-        Coarse model (get_rays only; no hierarchical sampling step)
+    coarse_model : dict[str, nn.Module)
+        Coarse networks (get_rays only; no hierarchical sampling step)
+        - feature_mlp
+        - scatter_mlp
+        - sh_mlp
+        - visibility_mlp
     kwargs_sample_stratified : dict, optional
         Additional kwargs for specified internal function, by default None
     n_samples_hierarchical : int, optional
         Additional kwargs for specified internal function, by default 0
     kwargs_sample_hierarchical : dict, optional
         Additional kwargs for specified internal function, by default None
-    fine_model : _type_, optional
+    fine_model : dict[str, nn.Module], optional
         Fine model (augments coarse model with hierarcihcal sampling step), by default None
+        - (dict keys same as coarse model; NOTE: use same modules as the ones used in coarse)
     viewdirs_encoding_fn : Optional[Callable[[torch.Tensor], torch.Tensor]], optional
         Positional encoding function for view directions, by default None
         NOTE: However, should be used!
@@ -601,31 +699,42 @@ def nerf_forward(
     viewdirs_encoding_fn = viewdirs_encoding_fn or encoding_fn
     outputs = {}    # returning a dict of values
 
-    # query points
+    # query coarse points
     points, z_vals = sample_rays(rays_o, rays_d, near, far,
                                  **kwargs_sample_stratified)
     
+    # chunkify (for memory) and apply positional encodings
     pt_chunks, viewdir_chunks = prepare_chunks(points.reshape(H*W,-1,3), rays_d.reshape(H*W,-1,3),
                                 encoding_fn=encoding_fn, 
                                 viewdirs_encoding_fn=viewdirs_encoding_fn,
-                                chunk_size=chunk_size)
-    # returns (HWS, encoding_dim) for both
+                                chunk_size=chunk_size) # returns (HWS, encoding_dim) for both
     
     outputs['z_vals_stratified'] = z_vals
     
     # COARSE predictions
-    raw_preds = []
+    raw_preds = {
+        "V_hat": [],
+        "sh_hat": [],
+        "sc_hat": [],
+    }
 
     for pt_chunk, viewdir_chunk in zip(pt_chunks, viewdir_chunks):
-        coarse_preds = coarse_model(pt_chunk, viewdir_chunk)
-        raw_preds.append(coarse_preds)
+        V_out  = coarse_nets["visibility_mlp"](pt_chunk, viewdir_chunk)
+        F_out  = coarse_nets["feature_mlp"](pt_chunk)
+        sh_out = coarse_nets["sh_mlp"](F_out)
+        sc_out = coarse_nets["scatter_mlp"](F_out)
+        raw_preds["V_hat"].append(V_out)
+        raw_preds["sh_hat"].append(sh_out)
+        raw_preds["sc_hat"].append(sc_out)
 
-    raw = torch.concat(raw_preds, dim=0).reshape(H, W, S_coarse, 4)
-    # with torch.no_grad():
-    #   print(f"RAW{raw.shape}:\nMEAN:{torch.mean(raw.reshape(-1,4), dim=0)}")
+    raw_v  = torch.concat(raw_preds["V_hat"],  dim=0).reshape(H*W, S_coarse, 1) # (transmittance) per samples per ray
+    raw_sc = torch.concat(raw_preds['sc_hat'], dim=0).reshape(H*W, S_coarse, 5) # scatter coefs (st[1],ss[3],g[1])
+    raw_sh = torch.concat(raw_preds["sh_hat"], dim=0).reshape(H*W, S_coarse, (2 ** sh_level) - 1) # sh_coefs
 
-    # TODO: IMPORTANT -- volume_render should use networks from ms_nerf.py
-    rgb_map, acc_map, weights, depth_map = volume_render(raw, z_vals, rays_d)
+
+    # input all network outputs to volume_render
+    rgb_map, acc_map, weights, depth_map = volume_render(
+        raw, points, z_vals, rays_d)
 
     # FINE pass predictions; process is basically the same as coarse pass
     if n_samples_hierarchical > 0 and fine_model is not None:
@@ -664,40 +773,3 @@ def nerf_forward(
     outputs['weights'] = weights
     
     return outputs
-
-
-# phase functions
-def sample_isotropic(u, v):
-    """
-    Sample uniformly across the sphere. 
-    Returns theta, phi.
-    NOTE: when using with sampling, the result is in RAY coordinates. Change to world coordinates.
-    """
-    theta = np.arccos(np.clip(2 * u - 1, -1, 1))
-    phi = 2 * np.pi * v
-    return torch.stack([theta, phi], dim=-1)
-
-
-def isotropic_pdf(x=0):
-    return np.full(len(x), 1 / (4 * np.pi))
-
-
-def sample_henyey_greenstein(u, v, g):
-    """
-    HG phase function parametrized by 'g' ranging from [-1, 1]. 
-    NOTE: when using with sampling, the result is in RAY coordinates. Change to world coordinates.
-    """
-    # u is "cos_theta" in HG
-    # g: Asymmetry parameter (-1 is full back-scattering, 1 is full frontal scattering)
-    if g == 0: # isotropic, avoid 0 denom
-        cos_theta = 2 * u - 1 
-    else:
-        # HG CDF
-        cos_theta = (1 + g**2 - ((1 - g**2) / (1 - g + 2 * g * u))**2) / (2 * g)
-    
-    theta = np.arccos(np.clip(cos_theta, -1, 1))
-    phi = 2 * np.pi * v
-    return torch.stack([theta, phi], dim=-1)
-
-def henyey_greenstein_pdf(cos_theta, g):
-    return (1 - g**2) / (4 * np.pi * (1 + g**2 - 2 * g * cos_theta)**(3/2))
