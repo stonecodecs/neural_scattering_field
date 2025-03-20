@@ -53,8 +53,9 @@ def get_chunks(
 def prepare_chunks(
     points: torch.tensor,
     rays_d: torch.tensor,
-    encoding_fn: Callable[[torch.tensor], torch.tensor],
-    viewdirs_encoding_fn: Callable[[torch.tensor], torch.tensor],
+    encoding_fn: Callable[[torch.tensor], torch.tensor]=None,
+    viewdirs_encoding_fn: Callable[[torch.tensor], torch.tensor]=None,
+    encode=False,
     chunk_size: int=2**15
 ) -> List[torch.tensor]:
     """Positional encoding + chunking step"""
@@ -62,13 +63,15 @@ def prepare_chunks(
     points_enc = encoding_fn(points) # (HW,S,points_L)
     viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True) # (HWS,3) unit vec
     viewdirs = viewdirs.expand(points.shape)
-    viewdirs_enc = viewdirs_encoding_fn(viewdirs) # (HW,S,enc_L)
-
-    points_enc = get_chunks(points_enc.reshape(-1, points_enc.shape[-1]), chunk_size=chunk_size)
-    viewdirs_enc = get_chunks(viewdirs_enc.reshape(-1, viewdirs_enc.shape[-1]), chunk_size=chunk_size)
+    if encode:
+        viewdirs = viewdirs_encoding_fn(viewdirs) # (HW,S,enc_L)
+        points_enc = get_chunks(points_enc.reshape(-1, points_enc.shape[-1]), chunk_size=chunk_size)
+        viewdirs_enc = get_chunks(viewdirs_enc.reshape(-1, viewdirs_enc.shape[-1]), chunk_size=chunk_size)
+        return points_enc, viewdirs_enc  # (HW,S,points_L), (HW,S,enc_L)
     
-    # print(len(points_enc), len(viewdirs_enc)) 10, 10
-    return points_enc, viewdirs_enc  # (HW,S,points_L), (HW,S,enc_L)
+    points_ = get_chunks(points.reshape(-1, points.shape[-1]), chunk_size=chunk_size)
+    viewdirs_ = get_chunks(viewdirs.reshape(-1, viewdirs.shape[-1]), chunk_size=chunk_size)
+    return points_, viewdirs_
 
 
 def quaternion_to_rotation_matrix(q):
@@ -246,7 +249,7 @@ def retrieve_sfm_data(camera_path: str, images_path: str, multi_cam=False):
     return poses, focal_len
 
 
-def ray_plot(origins, directions) -> None:
+def ray_plot(origins, directions, arrow_length=0.5) -> None:
     fig = plt.figure(figsize=(5, 5))
     ax  = fig.add_subplot(projection='3d')
     
@@ -256,7 +259,7 @@ def ray_plot(origins, directions) -> None:
     origins[..., 2].flatten(), # x,y,z ray origins
     directions[..., 0].flatten(),
     directions[..., 1].flatten(),
-    directions[..., 2].flatten(), length=0.5, normalize=True) # u,v,w directions
+    directions[..., 2].flatten(), length=arrow_length, normalize=True) # u,v,w directions
     ax.set_xlabel('X')
     ax.set_ylabel('Y')
     ax.set_zlabel('z')

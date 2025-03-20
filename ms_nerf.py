@@ -102,7 +102,8 @@ class SphericalHarmonicsMLP(nn.Module):
         return sh_coeffs.view(-1, 3, self.num_sh_coeffs)  # Shape: [B, 3, (l_max+1)^2]
     
 
-# Predicts transmittance T
+# Predicts final transmittance T
+# example: (----->|||-->|-> then -> is T)
 class VisibilityMLP(nn.Module):
     # Expects PE encoded position and dimensional vectors; takes in as input their concatenated vector
     def __init__(self, posenc_dim, direnc_dim, dim_z=256, dim_out=1, num_layers=4):
@@ -112,10 +113,7 @@ class VisibilityMLP(nn.Module):
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers, output_activation="Sigmoid")
 
     def forward(self, x, d):
-        pos_enc = self.pos_encoder(x)
-        dir_enc = self.dir_encoder(d)
-        x = torch.cat([pos_enc, dir_enc], dim=-1)
-        return self.mlp(x).squeeze(-1)
+        return self.mlp(torch.concat([x, d], dim=1)).squeeze(-1)
 
 
 # DEPRECATED -- decoupling is best

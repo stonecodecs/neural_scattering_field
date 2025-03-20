@@ -1,5 +1,6 @@
 ## spherical harmonics related functions
 import numpy as np
+import torch
 from PIL import Image
 from scipy.special import factorial, lpmv
 import matplotlib.pyplot as plt
@@ -21,6 +22,7 @@ def K(l, m):
 
 
 # Project environment map to SH
+# mainly for demonstration
 # lmax=2 (9 coefficients is enough for SH lighting)
 def project_to_sh(
     env_map,
@@ -34,34 +36,35 @@ def project_to_sh(
     Sampling is default to uniform distribution.
 
     Args:
-        env_map (ndarray): _description_
+        env_map (torch.tensor): _description_
         lmax (int, optional): level/order of SH. Defaults to 2.
         num_samples (int, optional): Samples to use for MC estimation. Defaults to 64.
-        phase_function (_type_, optional): Function that takes random (u,v). Defaults to sample_isotropic.
+        phase_function (_type_, optional): Function that takes random (u,v).
         sample_pdf (_type_, optional): Function that takes in (x) and outputs PDF of phase function.
-            Defaults to isotropic_pdf.
 
     Returns:
         SH coefficients (3 for RGB, 9 coefficients)
     """
     H, W, _ = env_map.shape
     num_coeffs = (lmax + 1) ** 2
-    c = np.zeros((num_coeffs, 3))  # SH coefficients (RGB)
+    c = torch.zeros((num_coeffs, 3))  # SH coefficients (RGB)
 
     # inverse transform sampling
-    u, v = np.random.rand(2, num_samples)
-    theta, phi = phase_function(u, v)
-    i = ((theta / np.pi) * (H-1)).astype(int)
-    j = ((phi / (2*np.pi)) * (W-1)).astype(int)
+    u, v = torch.rand(2, num_samples)
+    theta_phi = phase_function(u, v)
+    theta = theta_phi[:, 0]
+    phi = theta_phi[:, 1]
+    i = torch.floor(((theta / np.pi) * (H-1))).type(torch.int)
+    j = torch.floor(((phi / (2*np.pi)) * (W-1))).type(torch.int)
     L = env_map[i, j]  # (num_samples, 3)
-    pdf = sample_pdf(np.cos(theta))
+    pdf = sample_pdf(theta) # technically cos_theta, but we assume isotropic so it doesn't matter (save computation)
 
     # SH coefficient
     for l in range(lmax + 1):
         for m in range(-l, l + 1):
             Y = sh_basis(l, m, theta, phi)
             index = l * (l + 1) + m   # flattened idx
-            c[index] += np.sum(L / pdf.reshape(num_samples, 1) * Y.reshape(num_samples, 1), axis=0) # (3,)
+            c[index] += torch.sum(L / pdf.reshape(num_samples, 1) * Y.reshape(num_samples, 1), axis=0) # (3,)
             
     return c / num_samples 
 
@@ -81,12 +84,12 @@ def reconstruct_sh_image(sh_coeffs, lmax, output_shape=(256, 512)):
         np.ndarray: Reconstructed RGB image of shape output_shape.
     """
     H, W = output_shape
-    recon_image = np.zeros((H, W, 3))
+    recon_image = torch.zeros((H, W, 3))
     
     # Create grid of spherical coordinates (theta, phi)
-    theta = np.linspace(0, np.pi, H)         # Polar angle (0 to pi)
-    phi = np.linspace(0, 2 * np.pi, W)       # Azimuthal angle (0 to 2pi)
-    theta_grid, phi_grid = np.meshgrid(theta, phi, indexing='ij')
+    theta = torch.linspace(0, np.pi, H)         # Polar angle (0 to pi)
+    phi = torch.linspace(0, 2 * np.pi, W)       # Azimuthal angle (0 to 2pi)
+    theta_grid, phi_grid = torch.meshgrid(theta, phi, indexing='ij')
     
     # For each (l, m), add its contribution to the image
     for l in range(lmax + 1):
@@ -95,7 +98,7 @@ def reconstruct_sh_image(sh_coeffs, lmax, output_shape=(256, 512)):
             coeff = sh_coeffs[index]  # SH coefficient (shape: (3,))
             
             # Compute SH basis function Y for all (theta, phi)
-            Y = np.zeros_like(theta_grid)
+            Y = torch.zeros_like(theta_grid)
             for i in range(H):
                 for j in range(W):
                     Y[i, j] = sh_basis(l, m, theta_grid[i, j], phi_grid[i, j])
@@ -109,7 +112,7 @@ def reconstruct_sh_image(sh_coeffs, lmax, output_shape=(256, 512)):
 def plot_sh_texture(recon_image):
     """ Given reconstructed image from SH coefficients, plot reconstruction. """
     recon_normalized = (recon_image - recon_image.min()) / (recon_image.max() - recon_image.min())
-    recon_normalized = (recon_normalized * 255).astype(np.uint8)
+    recon_normalized = (recon_normalized * 255).type(torch.int)
 
     plt.figure(figsize=(10, 5))
     plt.imshow(recon_normalized)
