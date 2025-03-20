@@ -78,52 +78,52 @@ def get_camera_poses(poses: torch.tensor, transpose=False, normalize=False) -> T
     return cam_origins / cam_origins.max() if normalize else cam_origins, cam_directions
 
 
-# def get_camera_poses(
-#     poses: torch.tensor,
-#     transpose: bool = False,
-#     normalize: bool = False,
-#     is_test: bool = False,
-#     center: Optional[torch.tensor] = None,
-#     scale: Optional[float] = None
-# ) -> Tuple[torch.tensor, torch.tensor]:
-#     """
-#     Extracts camera origins and -z vectors from 4x4 extrinsic matrices.
-#
-#     Args:
-#         poses (torch.tensor): Camera poses (N, 4, 4)
-#         transpose (bool): Whether the poses are stored in column-major order.
-#         normalize (bool): If True, normalize the camera origins using the provided center and scale.
-#         is_test (bool): Whether these are test poses (which need their directions re-computed).
-#         center (Optional[torch.tensor]): A (1,3) tensor representing the scene center in world space.
-#         scale (Optional[float]): A scalar to use for normalizing the camera origins.
-#     Returns:
-#         torch.tensor: Camera origins (N, 3)
-#         torch.tensor: Camera directions (-Z unit vectors) (N, 3)
-#     """
-#     poses_ = poses.transpose(-1, -2) if transpose else poses # if column-wise
-#     cam_origins = poses_[..., :3, 3].clone() # translation components of matrix
-#
-#     if normalize and center is not None and scale is not None:
-#         cam_origins = (cam_origins - center) / scale
-#
-#     if not is_test:
-#         # For training, use the -Z axis of the rotation matrix.
-#         cam_directions = -poses_[..., :3, 2]
-#         print(f"Train: {cam_origins[0], cam_directions[0]}")
-#         print(f"Train: {cam_origins[1], cam_directions[1]}")
-#         print(f"Train: {cam_origins[2], cam_directions[2]}")
-#     else:
-#         # For test poses, override the direction.
-#         # After normalization, the scene center is at 0, so we want the camera to look toward the origin.
-#         # That is, the desired direction is -normalized_origin.
-#         diff = -cam_origins
-#         norm = torch.norm(diff, dim=-1, keepdim=True)
-#         cam_directions = diff / (norm + 1e-9)
-#         print(f"Test: {cam_origins[0], cam_directions[0]}")
-#         print(f"Test: {cam_origins[1], cam_directions[1]}")
-#         print(f"Test: {cam_origins[2], cam_directions[2]}")
-#
-#     return cam_origins, cam_directions
+def get_camera_poses_normalized(
+    poses: torch.tensor,
+    transpose: bool = False,
+    normalize: bool = False,
+    is_test: bool = False,
+    center: Optional[torch.tensor] = None,
+    scale: Optional[float] = None
+) -> Tuple[torch.tensor, torch.tensor]:
+    """
+    Extracts camera origins and -z vectors from 4x4 extrinsic matrices.
+
+    Args:
+        poses (torch.tensor): Camera poses (N, 4, 4)
+        transpose (bool): Whether the poses are stored in column-major order.
+        normalize (bool): If True, normalize the camera origins using the provided center and scale.
+        is_test (bool): Whether these are test poses (which need their directions re-computed).
+        center (Optional[torch.tensor]): A (1,3) tensor representing the scene center in world space.
+        scale (Optional[float]): A scalar to use for normalizing the camera origins.
+    Returns:
+        torch.tensor: Camera origins (N, 3)
+        torch.tensor: Camera directions (-Z unit vectors) (N, 3)
+    """
+    poses_ = poses.transpose(-1, -2) if transpose else poses # if column-wise
+    cam_origins = poses_[..., :3, 3].clone() # translation components of matrix
+
+    if normalize and center is not None and scale is not None:
+        cam_origins = (cam_origins - center) / scale
+
+    if not is_test:
+        # For training, use the -Z axis of the rotation matrix.
+        cam_directions = -poses_[..., :3, 2]
+        print(f"Train: {cam_origins[0], cam_directions[0]}")
+        print(f"Train: {cam_origins[1], cam_directions[1]}")
+        print(f"Train: {cam_origins[2], cam_directions[2]}")
+    else:
+        # For test poses, override the direction.
+        # After normalization, the scene center is at 0, so we want the camera to look toward the origin.
+        # That is, the desired direction is -normalized_origin.
+        diff = -cam_origins
+        norm = torch.norm(diff, dim=-1, keepdim=True)
+        cam_directions = diff / (norm + 1e-9)
+        print(f"Test: {cam_origins[0], cam_directions[0]}")
+        print(f"Test: {cam_origins[1], cam_directions[1]}")
+        print(f"Test: {cam_origins[2], cam_directions[2]}")
+
+    return cam_origins, cam_directions
 
 
 def get_rays(cam_extrinsics: torch.tensor,
