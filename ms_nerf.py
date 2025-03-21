@@ -118,6 +118,29 @@ class VisibilityMLP(nn.Module):
         return self.mlp(torch.concat([x_enc, d_enc], dim=1))
 
 
+def create_default_network_component_dict(device="cpu"):
+    """
+    Creates default valued instantiated network components.  
+    Returns dict of:
+        - feature_mlp
+        - scatter_mlp
+        - sh_mlp
+        - visibility_mlp
+    """
+    pe_x =  PositionalEncoder(3, 8, include_input=True, device=device)
+    pe_d =  PositionalEncoder(3, 1, include_input=True, device=device)
+    f_mlp = FeatureMLP(pe_x.output_dim)
+    sc_mlp = ScatterMLP(f_mlp.output_dim)
+    sh_mlp = SphericalHarmonicsMLP(f_mlp.output_dim, lmax=2)
+    v_mlp = VisibilityMLP(pe_x.output_dim, pe_d.output_dim)
+    return {
+        "feature_mlp": f_mlp,
+        "scatter_mlp": sc_mlp,
+        "sh_mlp": sh_mlp,
+        "visibility_mlp": v_mlp,
+    }
+
+
 # DEPRECATED -- decoupling is best
 # class NeuralScatteringField(nn.Module):
 #     def __init__(self,

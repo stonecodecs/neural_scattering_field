@@ -29,7 +29,7 @@ def sample_isotropic(u, v):
 
 
 def isotropic_pdf(x=0):
-    return np.full(len(x), 1 / (4 * np.pi))
+    return torch.full((len(x) if (type(x) != int) else x,), 1 / (4 * np.pi))
 
 
 def sample_henyey_greenstein(u, v, g):
@@ -39,13 +39,22 @@ def sample_henyey_greenstein(u, v, g):
     """
     # u is "cos_theta" in HG
     # g: Asymmetry parameter (-1 is full back-scattering, 1 is full frontal scattering)
-    if g == 0: # isotropic, avoid 0 denom
-        cos_theta = 2 * u - 1 
+    # HG CDF
+
+    # incredibly hacky and ugly (need to refine)
+    if isinstance(g, float):
+        if g == 0:
+            cos_theta = 2 * u - 1
+        else:
+            cos_theta = (1 + g**2 - ((1 - g**2) / (1 - g + 2 * g * u))**2) / (2 * g)
     else:
-        # HG CDF
         cos_theta = (1 + g**2 - ((1 - g**2) / (1 - g + 2 * g * u))**2) / (2 * g)
+
+    if not isinstance(g, float): 
+        uniform_idx = g.squeeze(-1) == 0
+        cos_theta[uniform_idx] = 2 * u[uniform_idx] - 1 # isotropic; avoid nan
     
-    theta = np.arccos(np.clip(cos_theta, -1, 1))
+    theta = torch.arccos(torch.clamp(cos_theta, -1, 1))
     phi = 2 * np.pi * v
     return torch.stack([theta, phi], dim=-1)
 
@@ -294,7 +303,18 @@ def eval_env_map(direction, env_map):
 
 
 def eval_sh(coefs, d, lmax=2, spherical=True):
-    """ Get radiance of SH lighting from direction d, given its coefficients. """
+    """
+    Get radiance of SH lighting from direction d, given its coefficients.
+
+    Args:
+        coefs (_type_): (NHWS, 3, 2**lmax - 1)
+        d (_type_): (NHW,64,3) or some lifted verison
+        lmax (int, optional): maximum spherical harmonic level. Defaults to 2.
+        spherical (bool, optional): d is in spherical coordinates. Defaults to True.
+
+    Returns:
+        rgb: (NHWS, num_samples, 3)
+    """
     # NOTE: make sure that the direction 'd' is world coordinates
     # an easy to miss bug would be using a direction straight from a sampler (still in ray coordinates)
 
@@ -306,13 +326,13 @@ def eval_sh(coefs, d, lmax=2, spherical=True):
         theta = torch.acos(z)
         phi = torch.atan2(y,x)
 
-    L = 0.0  # radiance
+    L = torch.zeros(coefs.shape[0], d.shape[-2], 3, device=coefs.device)  # radiance (NHWS, 64, 3)
     for l in range(lmax + 1):
         for m in range(-l, l + 1):
-            Y = sh_basis(l, m, theta, phi)
+            Y = sh_basis(l, m, theta, phi).unsqueeze(-1)
             index = l * (l + 1) + m   # flattened idx
-            L += coefs[index] * Y
-    return L
+            L += coefs[..., index].unsqueeze(-2) * Y
+    return torch.clamp(L, min=0)
 
 
 def sample_next_directions(ray_dir, phase_function, num_samples):
@@ -321,7 +341,7 @@ def sample_next_directions(ray_dir, phase_function, num_samples):
     Automatically converts into world coordinates. 
 
     Args:
-        ray_dir (3 vector): current direction of the main ray before scattering ([N,]H,W,3)
+        ray_dir (3 vector): current direction of the main ray before scattering ([N,]HWS,3)
             (Meaning: direction of ray for all "pixels")
         phase_function (function): phase function that takes in UV random [0,1] values
         num_samples (int): Number of directions to sample.
@@ -332,7 +352,7 @@ def sample_next_directions(ray_dir, phase_function, num_samples):
     orig_shape = ray_dir.shape
     ray_dir_flat = ray_dir.reshape(-1, 3)
     R = local_to_world_rotation(ray_dir_flat) # (NHWS,3,3)
-    theta_phi = phase_function(*torch.rand(2, num_samples)) # w.r.t the current ray direction [-1, 1]
+    theta_phi = phase_function(*torch.rand(2, ray_dir.shape[0], num_samples)) # w.r.t the current ray direction [-1, 1]
     local_dirs = spherical_to_cartesian(theta_phi) # (num_samples, 3)
     world_dirs = torch.einsum("bij,kj->bki", R, local_dirs)
     # sample_dirs = R @ spherical_to_cartesian(theta, phi)
@@ -347,6 +367,7 @@ def single_scatter(
     v_hats,
     sigma_s,
     g,
+    verbose=False
 ):
     """
     Returns the approximate light contribution using HG phase function to query the environment map.
@@ -365,7 +386,9 @@ def single_scatter(
     HW, num_samples = ray_dirs.shape[:2]
     cos_theta = torch.sum(ray_dirs.reshape(-1, 3) * sample_dirs.reshape(-1, 3), dim=-1)  # (...) dot product per row for PDF
     cos_theta = torch.clamp(cos_theta, min=-1.0, max=1.0)
-    pdf = torch.nan_to_num(henyey_greenstein_pdf(cos_theta, g), nan=1e-6) # (scalar) NOTE: possibly 1e-6 hardcoded is a bad idea
+    pdf = henyey_greenstein_pdf(cos_theta, g)
+    if verbose: 
+        print(pdf)
 
     L_env = eval_env_map(sample_dirs, env_map).reshape(HW, num_samples, 3) # environment lighting (..., S, 3) RGB
     L_env = torch.as_tensor(L_env) * v_hats.reshape(HW, num_samples, 1)
@@ -373,23 +396,25 @@ def single_scatter(
     return L.view(-1,3)  # will be multiplied by corresponding transmittance in 'volume_render'
 
 
-def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, ray_dir: torch.Tensor, num_samples=64):
+def multi_scatter(sh_coefs: torch.Tensor, sigma_s: torch.tensor, ray_dir: torch.Tensor, num_samples=64):
     """
     Returns the approximate light contribution in the direction of omega_out (from light to eye)
     using the raw spherical harmonics predicted coefficients from SHNet.
     
     Args:
-        sh_coefs (torch.Tensor): Outputs from SH MLP
-        sigma_s (float): Scattering Coefficient from ScatterMLP
-        current_dir (Tensor): current ray direction
+        sh_coefs (torch.tensor): Outputs from SH MLP (NHWS,3,9)
+        sigma_s (torch.tensor): Scattering Coefficient from ScatterMLP (1,3)
+        current_dir (Tensor): current ray direction (NHW,3)
         num_samples (int, optional): Number of samples used to evaluate radiance. Defaults to 64.
 
     Returns:
-        Radiance estimated from Monte Carlo (3,) for RGB
+        Radiance estimated from Monte Carlo (NHWS, 3) for RGB
     """
-    sample_dirs = sample_next_directions(ray_dir, phase_function=sample_isotropic, num_samples=num_samples)
+    sample_dirs = sample_next_directions(
+        ray_dir, phase_function=sample_isotropic, num_samples=num_samples) # (NHWS, num_samples, 3)
     L_sh = eval_sh(sh_coefs, sample_dirs, spherical=False)  # get radiance of light at point in the map
-    return (L_sh * sigma_s / isotropic_pdf()).mean(dim=0)   # (..., 3); T is baked into the learned coefficients
+    L_sh = torch.mean(L_sh * sigma_s.view(1, 1, 3) / isotropic_pdf(L_sh.shape[-2]).view(1, num_samples, 1), dim=-2)  # MC estimate; "T" is baked into the learned coefficients
+    return L_sh
 
 
 def volume_render(
@@ -480,7 +505,7 @@ def volume_render(
     # add the contributions from single and multi scattering cases
     Ls = single_scatter(env_map, rays_d, sample_d, sigma_s, v_hats, g_phase_param)
     Lm = multi_scatter(sh_coefs, sigma_s, rays_d)
-    L = Ls + Lm  # output shape: ([N,] H, W, S, 3)
+    L = Ls + Lm  # output shape: ([N,]HWS, 3)
     
     rgb_map = torch.sum(L * weights.unsqueeze(-1), dim=-2) # sum sample contributions ([N,] H, W, 3)
     depth_map = torch.sum(weights * z_vals, dim=-1)
@@ -636,19 +661,18 @@ def nerf_forward(
     far: float,
     # PE function
     encoding_fn: Callable[[torch.Tensor], torch.Tensor],
+    viewdirs_encoding_fn: Callable[[torch.Tensor], torch.Tensor],
     env_map: torch.tensor,
     coarse_nets: dict[str, nn.Module], # coarse network components
     fine_nets: dict[str, nn.Module] = None, # coarse + fine samples, fine network components
     kwargs_sample_stratified: dict = None,
-    n_samples_hierarchical: int = 0,
     kwargs_sample_hierarchical: dict = None,
-    viewdirs_encoding_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     sh_level: int = 2,
-    num_samples_per_point: int = 64,
+    num_samples_per_point: int = 64, # this is num_samples when sampling a phase function
     chunk_size: int = 2**15
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     """
-    NeRF forward pass.
+    Multi-scattering NeRF forward pass.
 
     Parameters
     ----------
@@ -694,7 +718,7 @@ def nerf_forward(
 
     H, W = rays_o.shape[:2]
     S_coarse = kwargs_sample_stratified.get('num_samples', 64)
-    S_fine   = n_samples_hierarchical
+    S_fine   = kwargs_sample_hierarchical.get('num_samples', 0)
 
     kwargs_sample_stratified = kwargs_sample_stratified or {}
     kwargs_sample_hierarchical = kwargs_sample_hierarchical or {}
@@ -704,8 +728,8 @@ def nerf_forward(
     # query coarse points
     points, z_vals = sample_rays(rays_o, rays_d, near, far,
                                  **kwargs_sample_stratified)
-    
-    # chunkify (for memory) (WITHOUT APPLYING ENCODINGS, different from NeRF)
+
+    # chunkify (for memory) (-- WITHOUT APPLYING ENCODINGS, different from NeRF)
     pt_chunks, viewdir_chunks = prepare_chunks(
         points.reshape(H*W,-1,3), rays_d.reshape(H*W,-1,3),
         encode=False, chunk_size=chunk_size) # returns (HWS, encoding_dim) for both
@@ -732,7 +756,7 @@ def nerf_forward(
 
         # for each query point, predict T for sampled 64 single-scatter directions
         bounce_dirs = sample_next_directions(
-            viewdir_chunk, lambda u,v: sample_henyey_greenstein(u,v,g=g), num_samples=64)
+            viewdir_chunk.reshape(chunk_size, -1), lambda u,v: sample_henyey_greenstein(u,v,g=g.view(-1, 1)), num_samples=64)
         
         # ENCODE bounce_dirs
         bounce_dirs_enc = encoding_fn(bounce_dirs.reshape(-1, bounce_dirs.shape[-1]))
@@ -754,13 +778,13 @@ def nerf_forward(
         raw_sc, points, z_vals, rays_d, bounce_dirs_total, raw_v, raw_sh, env_map)
 
     # FINE pass predictions; process is basically the same as coarse pass
-    if n_samples_hierarchical > 0 and fine_nets is not None:
+    if fine_nets is not None and kwargs_sample_hierarchical['num_samples'] > 0:
         # store coarse output maps
         rgb_map_coarse, depth_map_coarse, acc_map_coarse = rgb_map, depth_map, acc_map
 
         points, all_z, fine_z = sample_hierarchical(
             rays_o, rays_d, z_vals, weights,
-            num_samples=n_samples_hierarchical, **kwargs_sample_hierarchical
+            **kwargs_sample_hierarchical
         )
 
         pt_chunks, viewdir_chunks = prepare_chunks(
@@ -786,7 +810,7 @@ def nerf_forward(
 
             # for each query point, predict T for sampled 64 single-scatter directions
             bounce_dirs_fine = sample_next_directions(
-                viewdir_chunk, lambda u,v: sample_henyey_greenstein(u,v,g=g_fine), num_samples=64)
+                viewdir_chunk.reshape(chunk_size, -1), lambda u,v: sample_henyey_greenstein(u,v,g=g_fine.view(-1, 1)), num_samples=64)
             
             # ENCODE bounce_dirs_fine
             bounce_dirs_fine_enc = encoding_fn(bounce_dirs_fine.reshape(-1, bounce_dirs_fine.shape[-1]))

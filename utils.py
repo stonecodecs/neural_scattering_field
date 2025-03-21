@@ -1,11 +1,13 @@
 ## miscellaneous functions
 import torch
 import numpy as np
-from typing import List, Dict, Union, Callable
+from typing import List, Dict, Union, Callable, Optional
 import matplotlib.pyplot as plt
 from PIL import Image
 import json
 import os
+import cv2
+import torch.nn.functional as F
 
 
 def measure_PSNR(image, ref, maxval=255):
@@ -58,12 +60,12 @@ def prepare_chunks(
     encode=False,
     chunk_size: int=2**15
 ) -> List[torch.tensor]:
-    """Positional encoding + chunking step"""
+    """Positional encoding (optional) + chunking step """
 
-    points_enc = encoding_fn(points) # (HW,S,points_L)
     viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True) # (HWS,3) unit vec
     viewdirs = viewdirs.expand(points.shape)
-    if encode:
+    if encode or encoding_fn is not None or viewdirs_encoding_fn is not None:
+        points_enc = encoding_fn(points) # (HW,S,points_L)
         viewdirs = viewdirs_encoding_fn(viewdirs) # (HW,S,enc_L)
         points_enc = get_chunks(points_enc.reshape(-1, points_enc.shape[-1]), chunk_size=chunk_size)
         viewdirs_enc = get_chunks(viewdirs_enc.reshape(-1, viewdirs_enc.shape[-1]), chunk_size=chunk_size)
@@ -249,7 +251,7 @@ def retrieve_sfm_data(camera_path: str, images_path: str, multi_cam=False):
     return poses, focal_len
 
 
-def ray_plot(origins, directions, arrow_length=0.5) -> None:
+def ray_plot(origins, directions, arrow_length=4) -> None:
     fig = plt.figure(figsize=(5, 5))
     ax  = fig.add_subplot(projection='3d')
     
@@ -291,3 +293,82 @@ def ray_plot_scaled(origins, directions) -> None:
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
     plt.show()
+
+
+def downsample(images: Union[np.ndarray, torch.Tensor], scaling_factor: int = 2, scale_rounding_mode: str = "floor", mode: Optional[str] = "area") -> Union[np.ndarray, torch.Tensor]:
+    """
+    Downsamples image(s) by a scaling factor (typically power of 2) while preserving aspect ratio.
+
+    Args:
+        images: Input image(s) as either:
+                - numpy array (H, W, C) or (B, H, W, C)
+                - PyTorch tensor (C, H, W) or (B, C, H, W)
+        scaling_factor: Downsampling factor (must be power of 2, e.g., 2, 4, 8)
+        scale_rounding_mode: Size rounding method ('floor', 'round', 'ceil')
+        mode: Interpolation mode (PyTorch: 'nearest', 'bilinear', 'bicubic', 'area';
+                OpenCV: 'nearest', 'linear', 'cubic', 'area', 'lanczos')
+
+    Returns:
+        Downsampled image(s) with same type as input
+    """
+
+    def get_new_size(size: int) -> int:
+        scaled = size / scaling_factor
+        if scale_rounding_mode == "floor":
+            return int(np.floor(scaled))
+        if scale_rounding_mode == "ceil":
+            return int(np.ceil(scaled))
+        if scale_rounding_mode == "round":
+            return int(np.round(scaled))
+        raise ValueError("Invalid scale_rounding_mode")
+
+    if isinstance(images, torch.Tensor):
+        if images.ndim not in [3, 4]:
+            raise ValueError("Input tensor must be 3D (C, H, W) or 4D (B, C, H, W)")
+
+        *_, h, w = images.shape
+        new_h, new_w = get_new_size(h), get_new_size(w)
+
+        # Handle tensor dimensions
+        if images.ndim == 3:
+            images = images.unsqueeze(0)
+
+        # Perform interpolation
+        resized = F.interpolate(
+            images,
+            size=(new_h, new_w),
+            mode=mode,
+            align_corners=False if mode not in ["nearest", "area"] else None
+        )
+
+        return resized.squeeze(0) if resized.ndim == 4 and images.ndim == 3 else resized
+
+    else:
+        # Handle numpy arrays
+        if images.ndim not in [3, 4]:
+            raise ValueError("Input array must be 3D (H, W, C) or 4D (B, H, W, C)")
+
+        # Get original dimensions
+        if images.ndim == 4:
+            b, h, w, c = images.shape
+        else:
+            h, w, c = images.shape
+            b = None
+
+        new_h, new_w = get_new_size(h), get_new_size(w)
+
+        cv_interpolation = {
+            "nearest": cv2.INTER_NEAREST,
+            "linear": cv2.INTER_LINEAR,
+            "cubic": cv2.INTER_CUBIC,
+            "area": cv2.INTER_AREA,
+            "lanczos": cv2.INTER_LANCZOS4
+        }.get(mode, cv2.INTER_AREA)
+
+        # Process batches
+        if b is not None:
+            resized = np.zeros((b, new_h, new_w, c), dtype=images.dtype)
+            for i in range(b):
+                resized[i] = cv2.resize(images[i], (new_w, new_h), interpolation=cv_interpolation)
+            return resized
+        return cv2.resize(images, (new_w, new_h), interpolation=cv_interpolation)

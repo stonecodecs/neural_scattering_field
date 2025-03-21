@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 
-## command line arguments interface
+# NOTE: as of right now, can only use through demo.ipynb
+
+## TODO: command line arguments interface
 parser = argparse.ArgumentParser(
     description="""
     Multi-scatter NeRF. 
