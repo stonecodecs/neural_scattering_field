@@ -50,7 +50,7 @@ def sample_henyey_greenstein(u, v, g):
     return torch.stack([theta, phi], dim=-1)
 
 def henyey_greenstein_pdf(cos_theta, g):
-    return (1 - g**2) / (4 * np.pi * (1 + g**2 - 2 * g * cos_theta)**(3/2))
+    return (1 - g**2) / (4 * np.pi * (1 + g**2 - 2 * g * cos_theta + 1e-6)**(3/2))
 
 
 def gen_HG_pair(g):
@@ -111,9 +111,9 @@ def get_camera_poses_normalized(
     if not is_test:
         # For training, use the -Z axis of the rotation matrix.
         cam_directions = -poses_[..., :3, 2]
-        print(f"Train: {cam_origins[0], cam_directions[0]}")
-        print(f"Train: {cam_origins[1], cam_directions[1]}")
-        print(f"Train: {cam_origins[2], cam_directions[2]}")
+        # print(f"Train: {cam_origins[0], cam_directions[0]}")
+        # print(f"Train: {cam_origins[1], cam_directions[1]}")
+        # print(f"Train: {cam_origins[2], cam_directions[2]}")
     else:
         # For test poses, override the direction.
         # After normalization, the scene center is at 0, so we want the camera to look toward the origin.
@@ -121,9 +121,9 @@ def get_camera_poses_normalized(
         diff = -cam_origins
         norm = torch.norm(diff, dim=-1, keepdim=True)
         cam_directions = diff / (norm + 1e-9)
-        print(f"Test: {cam_origins[0], cam_directions[0]}")
-        print(f"Test: {cam_origins[1], cam_directions[1]}")
-        print(f"Test: {cam_origins[2], cam_directions[2]}")
+        # print(f"Test: {cam_origins[0], cam_directions[0]}")
+        # print(f"Test: {cam_origins[1], cam_directions[1]}")
+        # print(f"Test: {cam_origins[2], cam_directions[2]}")
 
     return cam_origins, cam_directions
 
@@ -344,33 +344,33 @@ def single_scatter(
     env_map,
     ray_dirs,
     sample_dirs, # directions of sampling (from predicted g)
+    v_hats,
     sigma_s,
     g,
-    phase_function_pdf=henyey_greenstein_pdf,
-    num_samples=64
 ):
     """
     Returns the approximate light contribution using HG phase function to query the environment map.
 
     Args:
         env_map (image): env map for lighting
-        x (vec3): 3D position of sample points along rays ([N]HWS, 3)
-        ray_dir (torch.tensor): ray direction per sample ([N,] H, W, 3) omit S duplicates
-        sigma_s (vec3): scattering coef
+        ray_dir (torch.tensor): ray direction per sample ([N]HWS, num_samples=64, 3) omit S duplicates
+            (may need to expand first dimension)
+        sigma_s (torch.tensor): scattering coef (1,3)
+        v_hats (torch.tensor): predicted transmittances per sample_dir ([N]HWS, num_samples, 1)
         g (float): HG parameter
-        visibility_network (_type_): VisibilityMLP
-        phase_function (_type_, optional): phase function sampler. Defaults to sample_henyey_greenstein.
-        phase_function_pdf (_type_, optional): pdf of phase function. Defaults to henyey_greenstein_pdf.
-        num_samples (int, optional): Number of samples to take from env_map. Defaults to 64.
 
     Returns:
-        torch.tensor: radiance (NHW,S,3), V_hat (NHW,S,3)
+        torch.tensor: radiance (NHWS,3), V_hat (NHWS,3)
     """
-    cos_theta = torch.sum(ray_dirs.view(-1,3) * sample_dirs.view(-1, 3), dim=-1)  # (...) dot product per row
-    pdf = torch.nan_to_num(phase_function_pdf(cos_theta, g), nan=1e-6)  # (scalar) NOTE: possibly 1e-6 hardcoded is a bad idea (used to avoid NaN)
-    L_env = eval_env_map(cos_theta, env_map) # environment lighting (...,S,3) RGB
-    L = torch.mean(L_env * T * sigma_s / pdf, dim=0) # (...,3)
-    return L, T
+    HW, num_samples = ray_dirs.shape[:2]
+    cos_theta = torch.sum(ray_dirs.reshape(-1, 3) * sample_dirs.reshape(-1, 3), dim=-1)  # (...) dot product per row for PDF
+    cos_theta = torch.clamp(cos_theta, min=-1.0, max=1.0)
+    pdf = torch.nan_to_num(henyey_greenstein_pdf(cos_theta, g), nan=1e-6) # (scalar) NOTE: possibly 1e-6 hardcoded is a bad idea
+
+    L_env = eval_env_map(sample_dirs, env_map).reshape(HW, num_samples, 3) # environment lighting (..., S, 3) RGB
+    L_env = torch.as_tensor(L_env) * v_hats.reshape(HW, num_samples, 1)
+    L = torch.mean(L_env * sigma_s.view(1, 1, 3) / pdf.view(-1, num_samples, 1), dim=-2) # (...,3) MC integral approx
+    return L.view(-1,3)  # will be multiplied by corresponding transmittance in 'volume_render'
 
 
 def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, ray_dir: torch.Tensor, num_samples=64):
@@ -420,10 +420,10 @@ def volume_render(
         Ray depths (from near plane) ([N,] H, W, S)
     rays_d : torch.tensor
         Ray directions. ([N,] H, W, 3)
-    sample_d : torch.tensor
+    sample_d : torch.tensor ([N]Sd, 3)
         The random samples (given HG phase function) per scatter point (samples in points)
     v_hats : torch.tensor
-        VisibilityMLP outputs for predicting T of (x,dir) pair
+        VisibilityMLP outputs for predicting T of (x,dir) pair ([N]HW*(Sd), 3)
     sh_coefs : torch.tensor
         SH coefficients for multi-scatter from SphericalHarmonicsMLP (9, 3)
     env_map : Optional[torch.tensor]
@@ -440,6 +440,7 @@ def volume_render(
         - accumul. map    ([N,]H,W),
         - weights         ([N,]H,W,S), 
         - depth map       ([N,]H,W) 
+        - visibility network outputs  ([N,]H,W) 
     """
     if batched:
         batched_vr = torch.vmap(
@@ -468,7 +469,7 @@ def volume_render(
         noise = torch.randn(raw[..., 3].shape, device=z_vals.device) * raw_noise_std
 
     # predict "initial" transmittance for each sample
-    sigma_t, sigma_s, g_phase_param = raw[..., :3]
+    sigma_t, sigma_s, g_phase_param = raw[..., 0:1], raw[..., 1:4], raw[..., 4:5]
     transmittance = torch.exp(-nn.functional.relu(sigma_t + noise) * delta_z) # (H,W,S)
     opacity = 1.0 - transmittance
     acc_T = torch.roll(torch.cumprod(transmittance + 1e-10, dim=-1), 1, dims=(-1))
@@ -477,7 +478,7 @@ def volume_render(
 
     # transmittance is already applied internally to the functions below
     # add the contributions from single and multi scattering cases
-    Ls = single_scatter(env_map, points, rays_d, sigma_s)
+    Ls = single_scatter(env_map, rays_d, sample_d, sigma_s, v_hats, g_phase_param)
     Lm = multi_scatter(sh_coefs, sigma_s, rays_d)
     L = Ls + Lm  # output shape: ([N,] H, W, S, 3)
     
@@ -489,7 +490,7 @@ def volume_render(
     if white_background:
         rgb_map = rgb_map + (1.0 - acc_map.unsqueeze(-1))
 
-    return rgb_map, acc_map, weights, depth_map
+    return rgb_map, acc_map, weights, depth_map, sigma_t  # sigma_t used to train visibility network
 
 
 def sample_fine(
@@ -643,6 +644,7 @@ def nerf_forward(
     kwargs_sample_hierarchical: dict = None,
     viewdirs_encoding_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     sh_level: int = 2,
+    num_samples_per_point: int = 64,
     chunk_size: int = 2**15
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
     """
@@ -736,7 +738,7 @@ def nerf_forward(
         bounce_dirs_enc = encoding_fn(bounce_dirs.reshape(-1, bounce_dirs.shape[-1]))
         
         # "query: at this point and direction, what's my T?"
-        V_out = coarse_nets["visibility_mlp"](pt_chunk_enc, bounce_dirs_enc) 
+        V_out = coarse_nets["visibility_mlp"](pt_chunk_enc.unsqueeze(1).expand(-1, num_samples_per_point, -1), bounce_dirs_enc) 
         raw_preds["sh_hat"].append(sh_out)
         raw_preds["sc_hat"].append(sc_out)
         raw_preds["v_hat"].append(V_out)
@@ -745,7 +747,7 @@ def nerf_forward(
     raw_sc = torch.concat(raw_preds['sc_hat'], dim=0).reshape(H*W, S_coarse, 5) # scatter coefs (st[1],ss[3],g[1])
     raw_sh = torch.concat(raw_preds["sh_hat"], dim=0).reshape(H*W, S_coarse, (2 ** sh_level) - 1) # sh_coefs
     raw_v  = torch.concat(raw_preds["v_hat"],  dim=0).reshape(H*W, S_coarse, 64) # single scatter Ts per scatter sample
-    bounce_dirs_total = torch.concat(bounce_dirs_total, dim=0).reshape(H*W, S_coarse, 64) # (num_chunks, 64) NOTE: CHECK THIS
+    bounce_dirs_total = torch.concat(bounce_dirs_total, dim=0).reshape(H*W, S_coarse, 64) #  NOTE: CHECK THIS
 
     # input all network outputs to volume_render
     rgb_map, acc_map, weights, depth_map = volume_render(
@@ -790,7 +792,7 @@ def nerf_forward(
             bounce_dirs_fine_enc = encoding_fn(bounce_dirs_fine.reshape(-1, bounce_dirs_fine.shape[-1]))
 
             # "query: at this point and direction, what's my T?"
-            V_out_fine = fine_nets["visibility_mlp"](pt_chunk_enc, bounce_dirs_fine_enc) 
+            V_out_fine = fine_nets["visibility_mlp"](pt_chunk_enc.unsqueeze(1).expand(-1, num_samples_per_point, -1), bounce_dirs_fine_enc) 
             raw_preds_fine["sh_hat"].append(sh_out_fine)
             raw_preds_fine["sc_hat"].append(sc_out_fine)
             raw_preds_fine["v_hat"].append(V_out_fine)

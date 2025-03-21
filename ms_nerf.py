@@ -10,6 +10,8 @@ def create_mlp(input_dim, latent_dim, output_dim, num_layers,
                output_activation=None, activation=nn.ReLU):
     layers = [nn.Sequential(nn.Linear(latent_dim if i > 0 else input_dim, latent_dim), activation())
               for i in range(num_layers - 1)]
+    if num_layers == 1: # hacky
+        layers = [nn.Linear(input_dim, latent_dim), activation()]
     layers.append(nn.Linear(latent_dim, output_dim))
     if output_activation is not None:
         layers.append(output_activation())
@@ -61,14 +63,14 @@ class PositionalEncoder(nn.Module):
 # Intermediate Feature Network
 class FeatureMLP(nn.Module):
     # input dimension dim_x should be post-PE
-    def __init__(self, dim_x=3*2*8, dim_z=256, dim_out=256, num_layers=8):
+    def __init__(self, dim_x, dim_z=256, dim_out=256, num_layers=8):
         super().__init__()
         self.mlp = create_mlp(dim_x, dim_z, dim_out, num_layers=num_layers)
+        self.output_dim = dim_out
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers)
 
-    def forward(self, x):
-        x_encoded = self.encoder(x)
-        return self.mlp(x_encoded)
+    def forward(self, x_enc):
+        return self.mlp(x_enc)
     
 
 # Scatter Network gets sigma_t, sigma_s, 'g'
@@ -80,11 +82,11 @@ class ScatterMLP(nn.Module):
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers)
 
     def forward(self, features):
-        output = self.layer(features)
-        sigma_t = torch.relu(output[:, 0])  # extinction
+        output = self.mlp(features)
+        sigma_t = torch.relu(output[:, 0:1])  # extinction
         sigma_s = torch.relu(output[:, 1:4])  # scattering (per RGB)
-        g = torch.tanh(output[:, 4])  # g [-1, 1]
-        return sigma_t, sigma_s, g
+        g = torch.tanh(output[:, 4:5])  # g [-1, 1]
+        return torch.concat([sigma_t, sigma_s, g], dim=1)
 
 
 # SH coefficient predictor MLP
@@ -93,13 +95,13 @@ class SphericalHarmonicsMLP(nn.Module):
     def __init__(self, dim_x=256, dim_z=128, num_layers=8, lmax=2):
         super().__init__()
         self.lmax = lmax
-        self.num_coef = (lmax + 1) ** 2  # num of SH coefficients (* 3 for RGB later)
-        self.mlp = create_mlp(dim_x, dim_z, self.num_coef * 3, num_layers=num_layers)
+        self.num_coefs = (lmax + 1) ** 2  # num of SH coefficients (* 3 for RGB later)
+        self.mlp = create_mlp(dim_x, dim_z, self.num_coefs * 3, num_layers=num_layers)
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, self.num_coef * 3, num_layers)
 
     def forward(self, features):
         sh_coeffs = self.mlp(features)
-        return sh_coeffs.view(-1, 3, self.num_sh_coeffs)  # Shape: [B, 3, (l_max+1)^2]
+        return sh_coeffs.view(-1, 3, self.num_coefs)  # Shape: [B, 3, (l_max+1)^2]
     
 
 # Predicts final transmittance T
@@ -112,8 +114,8 @@ class VisibilityMLP(nn.Module):
         self.mlp = create_mlp(input_dim, dim_z, dim_out, num_layers=num_layers, output_activation=nn.Sigmoid)
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers, output_activation="Sigmoid")
 
-    def forward(self, x, d):
-        return self.mlp(torch.concat([x, d], dim=1)).squeeze(-1)
+    def forward(self, x_enc, d_enc):
+        return self.mlp(torch.concat([x_enc, d_enc], dim=1))
 
 
 # DEPRECATED -- decoupling is best

@@ -249,7 +249,23 @@ def retrieve_sfm_data(camera_path: str, images_path: str, multi_cam=False):
     return poses, focal_len
 
 
-def ray_plot(origins, directions) -> None:
+def ray_plot(origins, directions, arrow_length=0.5) -> None:
+    fig = plt.figure(figsize=(5, 5))
+    ax  = fig.add_subplot(projection='3d')
+    
+    _ = ax.quiver(
+    origins[..., 0].flatten(),
+    origins[..., 1].flatten(),
+    origins[..., 2].flatten(), # x,y,z ray origins
+    directions[..., 0].flatten(),
+    directions[..., 1].flatten(),
+    directions[..., 2].flatten(), length=arrow_length, normalize=True) # u,v,w directions
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('z')
+    plt.show()
+
+def ray_plot_scaled(origins, directions) -> None:
     fig = plt.figure(figsize=(5, 5))
     ax = fig.add_subplot(projection='3d')
 
