@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # if using tinycudann, uncomment the related region of code per class
 
 def create_mlp(input_dim, latent_dim, output_dim, num_layers,
@@ -15,7 +14,6 @@ def create_mlp(input_dim, latent_dim, output_dim, num_layers,
     if output_activation is not None:
         layers.append(output_activation())
     return nn.Sequential(*layers)
-
 
 # def create_tinycudann_mlp(input_dim, latent_dim, output_dim, num_layers,
 #                           output_activation="None", activation="ReLU"):
@@ -32,7 +30,7 @@ def create_mlp(input_dim, latent_dim, output_dim, num_layers,
 #     )
 
 # Traditional PE used in NeRF.
-# If using TensoRF, we won't use this.
+# If using TensoRF, we won't use this. 
 # Also, Fourier Feature Transforms may be better.
 class PositionalEncoder(nn.Module):
     def __init__(self, input_dim, encoding_dim, log_space=False, **kwargs):
@@ -46,7 +44,7 @@ class PositionalEncoder(nn.Module):
 
         if self.log_space:
             freqs = 2.0 ** torch.linspace(0.0, self.encoding_dim - 1, encoding_dim, device=self.device)
-        else:  # linear space
+        else: # linear space
             freqs = torch.linspace(2.0 ** 0, 2.0 ** (self.encoding_dim - 1), self.encoding_dim, device=self.device)
 
         for freq in freqs:
@@ -63,7 +61,7 @@ class PositionalEncoder(nn.Module):
 # Intermediate Feature Network
 class FeatureMLP(nn.Module):
     # input dimension dim_x should be post-PE
-    def __init__(self, dim_x=3 * 2 * 8, dim_z=256, dim_out=256, num_layers=8):
+    def __init__(self, dim_x=3*2*8, dim_z=256, dim_out=256, num_layers=8):
         super().__init__()
         self.mlp = create_mlp(dim_x, dim_z, dim_out, num_layers=num_layers)
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers)
@@ -71,7 +69,7 @@ class FeatureMLP(nn.Module):
     def forward(self, x):
         x_encoded = self.encoder(x)
         return self.mlp(x_encoded)
-
+    
 
 # Scatter Network gets sigma_t, sigma_s, 'g'
 class ScatterMLP(nn.Module):
@@ -102,9 +100,10 @@ class SphericalHarmonicsMLP(nn.Module):
     def forward(self, features):
         sh_coeffs = self.mlp(features)
         return sh_coeffs.view(-1, 3, self.num_sh_coeffs)  # Shape: [B, 3, (l_max+1)^2]
+    
 
-
-# Predicts transmittance T
+# Predicts final transmittance T
+# example: (----->|||-->|-> then -> is T)
 class VisibilityMLP(nn.Module):
     # Expects PE encoded position and dimensional vectors; takes in as input their concatenated vector
     def __init__(self, posenc_dim, direnc_dim, dim_z=256, dim_out=1, num_layers=4):
@@ -114,10 +113,8 @@ class VisibilityMLP(nn.Module):
         # self.mlp = create_tinycudann_mlp(dim_x, dim_z, dim_out, num_layers, output_activation="Sigmoid")
 
     def forward(self, x, d):
-        pos_enc = self.pos_encoder(x)
-        dir_enc = self.dir_encoder(d)
-        x = torch.cat([pos_enc, dir_enc], dim=-1)
-        return self.mlp(x).squeeze(-1)
+        return self.mlp(torch.concat([x, d], dim=1)).squeeze(-1)
+
 
 # DEPRECATED -- decoupling is best
 # class NeuralScatteringField(nn.Module):
@@ -161,7 +158,7 @@ class VisibilityMLP(nn.Module):
 
 #         # visibility branch
 #         T = self.V(x_encoded, d_encoded) # "transmittance given a direction @ x"
-
+        
 
 #         # main branch
 #         # multiple scatter function(sh_coefs, g, sigma_s)
@@ -172,3 +169,4 @@ class VisibilityMLP(nn.Module):
 
 
 #         # return single + multi (image prediction)
+

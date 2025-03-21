@@ -66,8 +66,9 @@ def get_camera_poses(poses: torch.tensor, transpose=False, normalize=False) -> T
 
     Args:
         poses (torch.tensor): Camera poses (N, 4, 4)
-        transpose (bool): Depending on the dataset, this is either
+        transpose (bool): Depending on the dataset, this is either 
         normalize (bool): normalize translational vectors to the range specified
+
     Returns:
         torch.tensor: Camera origins (N, 3)
         torch.tensor: Camera directions (-Z unit vectors) (N, 3)
@@ -78,6 +79,7 @@ def get_camera_poses(poses: torch.tensor, transpose=False, normalize=False) -> T
     return cam_origins / cam_origins.max() if normalize else cam_origins, cam_directions
 
 
+# used for easier to see plotting
 def get_camera_poses_normalized(
     poses: torch.tensor,
     transpose: bool = False,
@@ -340,12 +342,10 @@ def sample_next_directions(ray_dir, phase_function, num_samples):
 
 def single_scatter(
     env_map,
-    x,  # current sample point along ray
-    ray_dir,
+    ray_dirs,
+    sample_dirs, # directions of sampling (from predicted g)
     sigma_s,
     g,
-    visibility_network,
-    phase_function=sample_henyey_greenstein,
     phase_function_pdf=henyey_greenstein_pdf,
     num_samples=64
 ):
@@ -364,17 +364,13 @@ def single_scatter(
         num_samples (int, optional): Number of samples to take from env_map. Defaults to 64.
 
     Returns:
-        torch.tensor: radiance (NHW,S,3)
+        torch.tensor: radiance (NHW,S,3), V_hat (NHW,S,3)
     """
-    # 'g' should be "baked-in" to the 'phase_function' when passing it (..., S, 3) as below
-    hg_for_g = lambda u,v: phase_function(u,v,g)
-    sample_dirs = sample_next_directions(ray_dir, phase_function=hg_for_g, num_samples=num_samples)
-    T = visibility_network(torch.full(len(sample_dirs.reshape(-1,3)), x), sample_dirs.reshape(-1, 3)) # (...,3) for both
-    cos_theta = torch.sum(ray_dir.view(-1,3) * sample_dirs.view(-1, 3), dim=-1)  # (...) dot product per row
+    cos_theta = torch.sum(ray_dirs.view(-1,3) * sample_dirs.view(-1, 3), dim=-1)  # (...) dot product per row
     pdf = torch.nan_to_num(phase_function_pdf(cos_theta, g), nan=1e-6)  # (scalar) NOTE: possibly 1e-6 hardcoded is a bad idea (used to avoid NaN)
     L_env = eval_env_map(cos_theta, env_map) # environment lighting (...,S,3) RGB
     L = torch.mean(L_env * T * sigma_s / pdf, dim=0) # (...,3)
-    return L
+    return L, T
 
 
 def multi_scatter(sh_coefs: torch.Tensor, sigma_s: float, ray_dir: torch.Tensor, num_samples=64):
@@ -401,7 +397,8 @@ def volume_render(
     points: torch.tensor,
     z_vals: torch.tensor,
     rays_d: torch.tensor,
-    visibility_network: nn.Module,
+    sample_d: torch.tensor,
+    v_hats: torch.tensor,
     sh_coefs: torch.tensor,
     env_map: torch.tensor,
     raw_noise_std: Optional[float] = 0.0,
@@ -423,8 +420,10 @@ def volume_render(
         Ray depths (from near plane) ([N,] H, W, S)
     rays_d : torch.tensor
         Ray directions. ([N,] H, W, 3)
-    visibility_network : nn.Module
-        VisibilityMLP to predict transmittance per randomly sampled next direction (for single-scattering)
+    sample_d : torch.tensor
+        The random samples (given HG phase function) per scatter point (samples in points)
+    v_hats : torch.tensor
+        VisibilityMLP outputs for predicting T of (x,dir) pair
     sh_coefs : torch.tensor
         SH coefficients for multi-scatter from SphericalHarmonicsMLP (9, 3)
     env_map : Optional[torch.tensor]
@@ -478,7 +477,7 @@ def volume_render(
 
     # transmittance is already applied internally to the functions below
     # add the contributions from single and multi scattering cases
-    Ls = single_scatter(env_map, points, rays_d, sigma_s, g_phase_param, visibility_network, num_samples=64)
+    Ls = single_scatter(env_map, points, rays_d, sigma_s)
     Lm = multi_scatter(sh_coefs, sigma_s, rays_d)
     L = Ls + Lm  # output shape: ([N,] H, W, S, 3)
     
@@ -636,6 +635,7 @@ def nerf_forward(
     far: float,
     # PE function
     encoding_fn: Callable[[torch.Tensor], torch.Tensor],
+    env_map: torch.tensor,
     coarse_nets: dict[str, nn.Module], # coarse network components
     fine_nets: dict[str, nn.Module] = None, # coarse + fine samples, fine network components
     kwargs_sample_stratified: dict = None,
@@ -703,41 +703,57 @@ def nerf_forward(
     points, z_vals = sample_rays(rays_o, rays_d, near, far,
                                  **kwargs_sample_stratified)
     
-    # chunkify (for memory) and apply positional encodings
-    pt_chunks, viewdir_chunks = prepare_chunks(points.reshape(H*W,-1,3), rays_d.reshape(H*W,-1,3),
-                                encoding_fn=encoding_fn, 
-                                viewdirs_encoding_fn=viewdirs_encoding_fn,
-                                chunk_size=chunk_size) # returns (HWS, encoding_dim) for both
+    # chunkify (for memory) (WITHOUT APPLYING ENCODINGS, different from NeRF)
+    pt_chunks, viewdir_chunks = prepare_chunks(
+        points.reshape(H*W,-1,3), rays_d.reshape(H*W,-1,3),
+        encode=False, chunk_size=chunk_size) # returns (HWS, encoding_dim) for both
     
     outputs['z_vals_stratified'] = z_vals
     
     # COARSE predictions
     raw_preds = {
-        "V_hat": [],
         "sh_hat": [],
         "sc_hat": [],
+        "v_hat": [],
     }
 
+    bounce_dirs_total = []
+
+    # prepare chunks; OUTPUT: (min([N]HW, chunk_size), 3)
     for pt_chunk, viewdir_chunk in zip(pt_chunks, viewdir_chunks):
-        V_out  = coarse_nets["visibility_mlp"](pt_chunk, viewdir_chunk)
-        F_out  = coarse_nets["feature_mlp"](pt_chunk)
+        # model predictions per chunk (to be aggregated after)
+        pt_chunk_enc = encoding_fn(pt_chunk.reshape(-1, pt_chunk.shape[-1]))
+        F_out  = coarse_nets["feature_mlp"](pt_chunk_enc)
         sh_out = coarse_nets["sh_mlp"](F_out)
         sc_out = coarse_nets["scatter_mlp"](F_out)
-        raw_preds["V_hat"].append(V_out)
+        g = sc_out[..., 4]
+
+        # for each query point, predict T for sampled 64 single-scatter directions
+        bounce_dirs = sample_next_directions(
+            viewdir_chunk, lambda u,v: sample_henyey_greenstein(u,v,g=g), num_samples=64)
+        
+        # ENCODE bounce_dirs
+        bounce_dirs_enc = encoding_fn(bounce_dirs.reshape(-1, bounce_dirs.shape[-1]))
+        
+        # "query: at this point and direction, what's my T?"
+        V_out = coarse_nets["visibility_mlp"](pt_chunk_enc, bounce_dirs_enc) 
         raw_preds["sh_hat"].append(sh_out)
         raw_preds["sc_hat"].append(sc_out)
+        raw_preds["v_hat"].append(V_out)
+        bounce_dirs_total.append(bounce_dirs) # (HW, S, 64) after loop + concat? NOTE: NEED TO CHECK THIS
 
-    raw_v  = torch.concat(raw_preds["V_hat"],  dim=0).reshape(H*W, S_coarse, 1) # (transmittance) per samples per ray
     raw_sc = torch.concat(raw_preds['sc_hat'], dim=0).reshape(H*W, S_coarse, 5) # scatter coefs (st[1],ss[3],g[1])
     raw_sh = torch.concat(raw_preds["sh_hat"], dim=0).reshape(H*W, S_coarse, (2 ** sh_level) - 1) # sh_coefs
-
+    raw_v  = torch.concat(raw_preds["v_hat"],  dim=0).reshape(H*W, S_coarse, 64) # single scatter Ts per scatter sample
+    bounce_dirs_total = torch.concat(bounce_dirs_total, dim=0).reshape(H*W, S_coarse, 64) # (num_chunks, 64) NOTE: CHECK THIS
 
     # input all network outputs to volume_render
     rgb_map, acc_map, weights, depth_map = volume_render(
-        raw, points, z_vals, rays_d)
+        raw_sc, points, z_vals, rays_d, bounce_dirs_total, raw_v, raw_sh, env_map)
 
     # FINE pass predictions; process is basically the same as coarse pass
-    if n_samples_hierarchical > 0 and fine_model is not None:
+    if n_samples_hierarchical > 0 and fine_nets is not None:
+        # store coarse output maps
         rgb_map_coarse, depth_map_coarse, acc_map_coarse = rgb_map, depth_map, acc_map
 
         points, all_z, fine_z = sample_hierarchical(
@@ -745,22 +761,48 @@ def nerf_forward(
             num_samples=n_samples_hierarchical, **kwargs_sample_hierarchical
         )
 
-        # prepare chunks again
         pt_chunks, viewdir_chunks = prepare_chunks(
             points.reshape(H*W,-1,3), rays_d.reshape(H*W,-1,3),
-            encoding_fn=encoding_fn,
-            viewdirs_encoding_fn=viewdirs_encoding_fn,
+            encode=False,
             chunk_size=chunk_size)
         
-        raw_preds_fine = []
-        for pt_chunk, viewdir_chunk in zip(pt_chunks, viewdir_chunks):
-            fine_preds = fine_model(pt_chunk, viewdir_chunk)
-            raw_preds_fine.append(fine_preds)
+        raw_preds_fine = {
+            "sh_hat": [],
+            "sc_hat": [],
+            "v_hat": [],
+        }
 
-        raw_preds_fine = torch.concat(raw_preds_fine, dim=0)
-        raw_preds_fine = raw_preds_fine.reshape(H, W, S_fine + S_coarse, 4)
-        
-        rgb_map, acc_map, weights, depth_map = volume_render(raw_preds_fine, all_z, rays_d)
+        bounce_dirs_total_fine = []
+
+        for pt_chunk, viewdir_chunk in zip(pt_chunks, viewdir_chunks):
+            # model predictions per chunk (to be aggregated after)
+            pt_chunk_enc = encoding_fn(pt_chunk.reshape(-1, pt_chunk.shape[-1]))
+            F_out_fine  = fine_nets["feature_mlp"](pt_chunk_enc)
+            sh_out_fine = fine_nets["sh_mlp"](F_out_fine)
+            sc_out_fine = fine_nets["scatter_mlp"](F_out_fine)
+            g_fine = sc_out[..., 4]
+
+            # for each query point, predict T for sampled 64 single-scatter directions
+            bounce_dirs_fine = sample_next_directions(
+                viewdir_chunk, lambda u,v: sample_henyey_greenstein(u,v,g=g_fine), num_samples=64)
+            
+            # ENCODE bounce_dirs_fine
+            bounce_dirs_fine_enc = encoding_fn(bounce_dirs_fine.reshape(-1, bounce_dirs_fine.shape[-1]))
+
+            # "query: at this point and direction, what's my T?"
+            V_out_fine = fine_nets["visibility_mlp"](pt_chunk_enc, bounce_dirs_fine_enc) 
+            raw_preds_fine["sh_hat"].append(sh_out_fine)
+            raw_preds_fine["sc_hat"].append(sc_out_fine)
+            raw_preds_fine["v_hat"].append(V_out_fine)
+            bounce_dirs_total_fine.append(bounce_dirs_fine) # (HW, S, 64) after loop + concat
+
+        raw_sc_fine = torch.concat(raw_preds_fine['sc_hat'], dim=0).reshape(H*W, S_fine + S_coarse, 5) # scatter coefs (st[1],ss[3],g[1])
+        raw_sh_fine = torch.concat(raw_preds_fine["sh_hat"], dim=0).reshape(H*W, S_fine + S_coarse, (2 ** sh_level) - 1) # sh_coefs
+        raw_v_fine = torch.concat(raw_preds_fine["v_hat"],  dim=0).reshape(H*W, S_fine + S_coarse, 64) # single scatter Ts per scatter sample
+        bounce_dirs_total_fine = torch.concat(bounce_dirs_total_fine, dim=0).reshape(H*W, S_fine + S_coarse, 64).permute(0,1,3,2) # (HW, S, 3, 64)
+    
+        rgb_map, acc_map, weights, depth_map = volume_render(
+            raw_sc_fine, points, z_vals, rays_d, bounce_dirs_total_fine, raw_v_fine, raw_sh_fine, env_map)
 
         outputs['z_vals_hierarchical'] = fine_z
         outputs['rgb_map_coarse'] = rgb_map_coarse

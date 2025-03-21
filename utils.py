@@ -53,8 +53,9 @@ def get_chunks(
 def prepare_chunks(
     points: torch.tensor,
     rays_d: torch.tensor,
-    encoding_fn: Callable[[torch.tensor], torch.tensor],
-    viewdirs_encoding_fn: Callable[[torch.tensor], torch.tensor],
+    encoding_fn: Callable[[torch.tensor], torch.tensor]=None,
+    viewdirs_encoding_fn: Callable[[torch.tensor], torch.tensor]=None,
+    encode=False,
     chunk_size: int=2**15
 ) -> List[torch.tensor]:
     """Positional encoding + chunking step"""
@@ -62,13 +63,15 @@ def prepare_chunks(
     points_enc = encoding_fn(points) # (HW,S,points_L)
     viewdirs = rays_d / torch.norm(rays_d, dim=-1, keepdim=True) # (HWS,3) unit vec
     viewdirs = viewdirs.expand(points.shape)
-    viewdirs_enc = viewdirs_encoding_fn(viewdirs) # (HW,S,enc_L)
-
-    points_enc = get_chunks(points_enc.reshape(-1, points_enc.shape[-1]), chunk_size=chunk_size)
-    viewdirs_enc = get_chunks(viewdirs_enc.reshape(-1, viewdirs_enc.shape[-1]), chunk_size=chunk_size)
+    if encode:
+        viewdirs = viewdirs_encoding_fn(viewdirs) # (HW,S,enc_L)
+        points_enc = get_chunks(points_enc.reshape(-1, points_enc.shape[-1]), chunk_size=chunk_size)
+        viewdirs_enc = get_chunks(viewdirs_enc.reshape(-1, viewdirs_enc.shape[-1]), chunk_size=chunk_size)
+        return points_enc, viewdirs_enc  # (HW,S,points_L), (HW,S,enc_L)
     
-    # print(len(points_enc), len(viewdirs_enc)) 10, 10
-    return points_enc, viewdirs_enc  # (HW,S,points_L), (HW,S,enc_L)
+    points_ = get_chunks(points.reshape(-1, points.shape[-1]), chunk_size=chunk_size)
+    viewdirs_ = get_chunks(viewdirs.reshape(-1, viewdirs.shape[-1]), chunk_size=chunk_size)
+    return points_, viewdirs_
 
 
 def quaternion_to_rotation_matrix(q):
